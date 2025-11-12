@@ -5,11 +5,12 @@ import {
   useMemo,
   useRef,
   useState,
+  useCallback,
   type Dispatch,
   type SetStateAction,
 } from 'react';
 import clsx from 'clsx';
-import type { fabric } from 'fabric';
+import type { fabric as FabricNamespace } from 'fabric';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -46,7 +47,7 @@ type LayoutMetaForm = z.infer<typeof layoutMetaSchema>;
 type RenderForm = z.infer<typeof renderSchema>;
 type MaterialForm = z.infer<typeof materialSchema>;
 type SettingsForm = z.infer<typeof settingsSchema>;
-type FabricStatic = typeof fabric;
+type FabricStatic = typeof FabricNamespace;
 
 type LayoutElementType = 'wall' | 'door' | 'window';
 
@@ -94,10 +95,18 @@ type ApiKeys = {
   assetStorage?: string;
 };
 
+type Point = { x: number; y: number };
+
 let fabricLoader: Promise<FabricStatic> | null = null;
 const getFabric = () => {
   if (!fabricLoader) {
-    fabricLoader = import('fabric').then((mod) => mod.fabric);
+    fabricLoader = import('fabric').then((mod) => {
+      const namespace = (mod as { fabric?: FabricStatic }).fabric;
+      if (namespace) {
+        return namespace;
+      }
+      return mod as FabricStatic;
+    });
   }
   return fabricLoader;
 };
@@ -135,18 +144,75 @@ const initialLayoutMeta = {
 const initialPrompt =
   'Modern Scandinavian living room with warm lighting and textured walls.';
 const initialStylePreset = 'natural-soft';
+const defaultColor = '#111111';
+const defaultWallThicknessMm = 200;
+
+function PolylineIcon({ active }: { active?: boolean }) {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <polyline
+        points="4 16 9 10 14 14 20 6"
+        stroke={active ? '#1d4ed8' : '#475569'}
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function RectangleIcon({ active }: { active?: boolean }) {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <rect
+        x="5"
+        y="6"
+        width="14"
+        height="12"
+        rx="2"
+        ry="2"
+        stroke={active ? '#1d4ed8' : '#475569'}
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function ArcIcon({ active }: { active?: boolean }) {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <path
+        d="M5 18a9 9 0 0 1 9-9h5"
+        stroke={active ? '#1d4ed8' : '#475569'}
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function DoorIcon() {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <rect x="5" y="6" width="12" height="12" stroke="#f97316" strokeWidth="2" />
+      <circle cx="14" cy="12" r="1" fill="#f97316" />
+    </svg>
+  );
+}
+
+function WindowIcon() {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+      <rect x="4" y="5" width="16" height="14" stroke="#3c6ff0" strokeWidth="2" />
+      <path d="M12 5v14" stroke="#3c6ff0" strokeWidth="2" />
+    </svg>
+  );
+}
 
 const palette: Record<
-  LayoutElementType,
+  Exclude<LayoutElementType, 'wall'>,
   { label: string; fill: string; width: number; height: number; opacity: number }
 > = {
-  wall: {
-    label: 'Wall',
-    fill: '#0f172a',
-    width: 220,
-    height: 26,
-    opacity: 1,
-  },
   door: {
     label: 'Door',
     fill: '#f97316',
@@ -162,6 +228,14 @@ const palette: Record<
     opacity: 0.65,
   },
 };
+
+const wallTools = [
+  { id: 'polyline', label: 'Polyline', icon: PolylineIcon },
+  { id: 'rectangle', label: 'Rectangle', icon: RectangleIcon },
+  { id: 'arc', label: 'Arc', icon: ArcIcon },
+] as const;
+
+type WallToolId = (typeof wallTools)[number]['id'];
 
 const styles = [
   { id: 'natural-soft', label: 'Natural soft light' },
@@ -195,6 +269,7 @@ export default function HomePage() {
   const [renderJobs, setRenderJobs] = useState<RenderJob[]>([]);
   const [materialEdits, setMaterialEdits] = useState<MaterialEdit[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKeys>({});
+  const [wallThicknessMm, setWallThicknessMm] = useState(defaultWallThicknessMm);
 
   const handleSaveMeta = (values: LayoutMetaForm) => {
     setLayoutMeta({
@@ -275,6 +350,8 @@ export default function HomePage() {
             elements={elements}
             onSaveMeta={handleSaveMeta}
             onElementsChange={setElements}
+            wallThicknessMm={wallThicknessMm}
+            onWallThicknessChange={setWallThicknessMm}
           />
         )}
         {activeStep === 2 && (
@@ -633,6 +710,8 @@ type LayoutStageProps = {
   elements: LayoutElement[];
   onSaveMeta: (values: LayoutMetaForm) => void;
   onElementsChange: (elements: LayoutElement[]) => void;
+  wallThicknessMm: number;
+  onWallThicknessChange: (value: number) => void;
 };
 
 function LayoutStage({
@@ -642,36 +721,54 @@ function LayoutStage({
   elements,
   onSaveMeta,
   onElementsChange,
+  wallThicknessMm,
+  onWallThicknessChange,
 }: LayoutStageProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const fabricRef = useRef<fabric.Canvas | null>(null);
   const fabricLibRef = useRef<FabricStatic | null>(null);
   const bgUrl = useRef<string | null>(null);
-  const [activeTool, setActiveTool] = useState<LayoutElementType>('wall');
+  const [activeWallTool, setActiveWallTool] = useState<WallToolId>('polyline');
   const [backdropName, setBackdropName] = useState<string | null>(null);
-  const ensureFabric = async () => {
+  const [isDrawing, setIsDrawing] = useState(false);
+  const thicknessPx = useMemo(() => Math.max(4, wallThicknessMm / 10), [wallThicknessMm]);
+  const [canvasReady, setCanvasReady] = useState(false);
+  const elementSeedRef = useRef(0);
+  type DrawingSession =
+    | { mode: 'polyline'; points: Point[]; temp?: fabric.Object }
+    | { mode: 'rectangle'; points: Point[]; temp?: fabric.Rect }
+    | { mode: 'arc'; points: Point[]; temp?: fabric.Object };
+  const drawingSession = useRef<DrawingSession | null>(null);
+  const activeToolRef = useRef<WallToolId>('polyline');
+  useEffect(() => {
+    activeToolRef.current = activeWallTool;
+  }, [activeWallTool]);
+  const ensureFabric = useCallback(async () => {
     if (fabricLibRef.current) {
       return fabricLibRef.current;
     }
     const lib = await getFabric();
     fabricLibRef.current = lib;
     return lib;
-  };
+  }, []);
 
 
   useEffect(() => {
     let disposed = false;
 
     const setupCanvas = async () => {
-      const fabricLib = await getFabric();
+      const fabricLib = await ensureFabric();
       if (disposed || !canvasRef.current) return;
-      fabricLibRef.current = fabricLib;
       const canvas = new fabricLib.Canvas(canvasRef.current, {
         selection: true,
         backgroundColor: '#f8fafc',
       });
       fabricRef.current = canvas;
+      canvas.hoverCursor = 'cell';
+      canvas.defaultCursor = 'cell';
+      fabricLibRef.current = fabricLib;
+      setCanvasReady(true);
 
       const persistElements = () => {
         const objs = canvas.getObjects();
@@ -708,8 +805,9 @@ function LayoutStage({
         URL.revokeObjectURL(bgUrl.current);
         bgUrl.current = null;
       }
+      setCanvasReady(false);
     };
-  }, [onElementsChange]);
+  }, [onElementsChange, ensureFabric]);
 
   useEffect(() => {
     const wrapper = wrapperRef.current;
@@ -731,21 +829,239 @@ function LayoutStage({
     return () => observer.disconnect();
   }, []);
 
-  const addElement = async (type: LayoutElementType) => {
+  useEffect(() => {
+    if (canvasRef.current) {
+      canvasRef.current.style.cursor = isDrawing ? 'crosshair' : 'cell';
+    }
+    if (fabricRef.current) {
+      fabricRef.current.defaultCursor = isDrawing ? 'crosshair' : 'cell';
+    }
+  }, [isDrawing]);
+
+  const cancelDrawing = useCallback(() => {
+    const canvas = fabricRef.current;
+    const session = drawingSession.current;
+    if (canvas && session?.temp) {
+      canvas.remove(session.temp);
+      canvas.requestRenderAll();
+    }
+    drawingSession.current = null;
+    setIsDrawing(false);
+  }, []);
+  const computeWallPolygon = useCallback(
+    (start: Point, end: Point) => {
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const ux = dx / length;
+      const uy = dy / length;
+      const half = thicknessPx / 2;
+      const offsetX = -uy * half;
+      const offsetY = ux * half;
+      return [
+        { x: start.x + offsetX, y: start.y + offsetY },
+        { x: start.x - offsetX, y: start.y - offsetY },
+        { x: end.x - offsetX, y: end.y - offsetY },
+        { x: end.x + offsetX, y: end.y + offsetY },
+      ];
+    },
+    [thicknessPx],
+  );
+
+  useEffect(() => {
+    if (!canvasReady) return;
     const canvas = fabricRef.current;
     if (!canvas) return;
+
+    const getPoint = (evt: MouseEvent): Point => {
+      const pointer = canvas.getPointer(evt);
+      return { x: pointer.x, y: pointer.y };
+    };
+
+    const handleMouseDown = async (opt: fabric.IEvent<MouseEvent>) => {
+      const mode = activeToolRef.current;
+      const point = getPoint(opt.e);
+      const fabricLib = await ensureFabric();
+      const session = drawingSession.current;
+
+      const beginSession = (tool: WallToolId, initialPoint: Point, temp?: fabric.Object) => {
+        drawingSession.current = { mode: tool, points: [initialPoint], temp } as DrawingSession;
+        setIsDrawing(true);
+      };
+
+      if (mode === 'polyline') {
+        if (!session || session.mode !== 'polyline') {
+          const temp = new fabricLib.Polyline([point], {
+            stroke: defaultColor,
+            strokeWidth: thicknessPx,
+            fill: 'rgba(17,17,17,0.15)',
+            selectable: false,
+            evented: false,
+            strokeLineJoin: 'round',
+          });
+          canvas.add(temp);
+          beginSession('polyline', point, temp);
+        } else {
+          session.points.push(point);
+          (session.temp as fabric.Polyline)?.set({ points: [...session.points] });
+          canvas.requestRenderAll();
+        }
+        return;
+      }
+
+      if (mode === 'rectangle') {
+        if (!session || session.mode !== 'rectangle') {
+          const initialPoints = computeWallPolygon(point, { x: point.x + 1, y: point.y + 1 });
+          const temp = new fabricLib.Polygon(initialPoints, {
+            fill: 'rgba(17,17,17,0.4)',
+            stroke: defaultColor,
+            strokeWidth: 1,
+            selectable: false,
+            evented: false,
+          });
+          canvas.add(temp);
+          beginSession('rectangle', point, temp);
+        } else {
+          const [start] = session.points;
+          const polygonPoints = computeWallPolygon(start, point);
+          const rect = new fabricLib.Polygon(polygonPoints, {
+            fill: defaultColor,
+            stroke: defaultColor,
+            strokeWidth: 1,
+          }) as FabricShape;
+          rect.data = { id: generateId(), type: 'wall', label: 'Rect wall' };
+          if (session.temp) canvas.remove(session.temp);
+          canvas.add(rect);
+          canvas.setActiveObject(rect);
+          canvas.requestRenderAll();
+          drawingSession.current = null;
+          setIsDrawing(false);
+        }
+        return;
+      }
+
+      if (mode === 'arc') {
+        if (!session || session.mode !== 'arc') {
+          beginSession('arc', point);
+        } else {
+          session.points.push(point);
+          if (session.points.length === 3) {
+            const [start, control, end] = session.points;
+            const pathString = `M ${start.x} ${start.y} Q ${control.x} ${control.y} ${end.x} ${end.y}`;
+            const arcPath = new fabricLib.Path(pathString, {
+              stroke: defaultColor,
+              strokeWidth: thicknessPx,
+              fill: 'rgba(17,17,17,0.1)',
+              strokeLineCap: 'round',
+            }) as FabricShape;
+            arcPath.data = { id: generateId(), type: 'wall', label: 'Arc wall' };
+            if (session.temp) canvas.remove(session.temp);
+            canvas.add(arcPath);
+            canvas.setActiveObject(arcPath);
+            canvas.requestRenderAll();
+            drawingSession.current = null;
+            setIsDrawing(false);
+          }
+        }
+      }
+    };
+
+    const handleMouseMove = (opt: fabric.IEvent<MouseEvent>) => {
+      const session = drawingSession.current;
+      if (!session) return;
+      const pointer = canvas.getPointer(opt.e);
+
+      if (session.mode === 'polyline') {
+        const temp = session.temp as fabric.Polyline;
+        if (temp) {
+          temp.set({ points: [...session.points, { x: pointer.x, y: pointer.y }] });
+          canvas.requestRenderAll();
+        }
+      } else if (session.mode === 'rectangle') {
+        const temp = session.temp as fabric.Polygon;
+        const [start] = session.points;
+        if (temp && start) {
+          const polygonPoints = computeWallPolygon(start, { x: pointer.x, y: pointer.y });
+          temp.set({ points: polygonPoints });
+          canvas.requestRenderAll();
+        }
+      } else if (session.mode === 'arc') {
+        const fabricLib = fabricLibRef.current;
+        if (!fabricLib) return;
+        const start = session.points[0];
+        const control = session.points[1] ?? { x: pointer.x, y: pointer.y };
+        const end = { x: pointer.x, y: pointer.y };
+        const pathString = `M ${start.x} ${start.y} Q ${control.x} ${control.y} ${end.x} ${end.y}`;
+        if (session.temp) {
+          canvas.remove(session.temp);
+        }
+        const tempPath = new fabricLib.Path(pathString, {
+          stroke: defaultColor,
+          strokeWidth: thicknessPx,
+          fill: 'rgba(17,17,17,0.1)',
+          selectable: false,
+          evented: false,
+        });
+        canvas.add(tempPath);
+        session.temp = tempPath;
+        canvas.requestRenderAll();
+      }
+    };
+
+    const handleDoubleClick = async () => {
+      const session = drawingSession.current;
+      const canvasInstance = fabricRef.current;
+      if (!session || !canvasInstance || session.mode !== 'polyline' || session.points.length < 2) {
+        return;
+      }
+      const fabricLib = await ensureFabric();
+      const polyline = new fabricLib.Polyline(session.points, {
+        stroke: '#0f172a',
+        strokeWidth: 18,
+        fill: '',
+        strokeLineJoin: 'round',
+      }) as FabricShape;
+      polyline.data = { id: generateId(), type: 'wall', label: 'Polyline wall' };
+      if (session.temp) canvasInstance.remove(session.temp);
+      canvasInstance.add(polyline);
+      canvasInstance.setActiveObject(polyline);
+      canvasInstance.requestRenderAll();
+      drawingSession.current = null;
+      setIsDrawing(false);
+    };
+
+    canvas.on('mouse:down', handleMouseDown);
+    canvas.on('mouse:move', handleMouseMove);
+    canvas.on('mouse:dblclick', handleDoubleClick);
+
+    return () => {
+      canvas.off('mouse:down', handleMouseDown);
+      canvas.off('mouse:move', handleMouseMove);
+      canvas.off('mouse:dblclick', handleDoubleClick);
+    };
+  }, [canvasReady, ensureFabric, thicknessPx, computeWallPolygon]);
+
+  const addElement = async (type: Exclude<LayoutElementType, 'wall'>) => {
+    const canvas = fabricRef.current;
+    if (!canvas) return;
+    cancelDrawing();
     const fabricLib = await ensureFabric();
-    const { fill, width, height, opacity, label } = palette[type];
+    const { width, height, opacity, label } = palette[type];
     const id = generateId();
+    const seed = elementSeedRef.current++;
+    const offsetX = ((seed % 5) - 2) * 18;
+    const offsetY = ((Math.floor(seed / 5) % 5) - 2) * 12;
     const rect = new fabricLib.Rect({
       width,
       height,
-      fill,
+      fill: defaultColor,
       opacity,
-      left: canvas.getWidth() / 2 - width / 2 + Math.random() * 60,
-      top: canvas.getHeight() / 2 - height / 2 + Math.random() * 40,
+      left: canvas.getWidth() / 2 - width / 2 + offsetX,
+      top: canvas.getHeight() / 2 - height / 2 + offsetY,
       rx: type === 'door' ? 8 : 4,
       ry: type === 'door' ? 8 : 4,
+      stroke: defaultColor,
+      strokeWidth: 2,
       hasRotatingPoint: true,
       cornerColor: '#3c6ff0',
       cornerStyle: 'circle',
@@ -758,6 +1074,7 @@ function LayoutStage({
     };
     canvas.add(rect);
     canvas.setActiveObject(rect);
+    canvas.requestRenderAll();
   };
 
   const handleBackdrop = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -782,8 +1099,13 @@ function LayoutStage({
   };
 
   const clearCanvas = () => {
-    fabricRef.current?.clear();
-    fabricRef.current?.setBackgroundColor('#f8fafc', fabricRef.current.renderAll.bind(fabricRef.current));
+    cancelDrawing();
+    const canvas = fabricRef.current;
+    if (canvas) {
+      canvas.getObjects().forEach((obj) => canvas.remove(obj));
+      canvas.setBackgroundImage(undefined, canvas.renderAll.bind(canvas));
+      canvas.setBackgroundColor('#f8fafc', canvas.renderAll.bind(canvas));
+    }
     onElementsChange([]);
     setBackdropName(null);
   };
@@ -810,13 +1132,19 @@ function LayoutStage({
     onSaveMeta(values);
   };
 
+  const selectWallTool = (tool: WallToolId) => {
+    if (tool === activeWallTool) return;
+    cancelDrawing();
+    setActiveWallTool(tool);
+  };
+
   return (
-    <section className="grid gap-6 rounded-3xl bg-transparent lg:grid-cols-2">
+    <section className="flex flex-col gap-6 rounded-3xl bg-transparent">
       <div className="rounded-3xl bg-white p-6 shadow-sm">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Studio canvas</p>
-            <h2 className="text-xl font-semibold text-slate-900">Map your layout</h2>
+            <h2 className="text-xl font-semibold text-slate-900">Draw the enclosure</h2>
           </div>
           <div className="flex gap-2">
             <input
@@ -828,48 +1156,117 @@ function LayoutStage({
             />
             <label
               htmlFor="layout-upload"
-              className="cursor-pointer rounded-full border border-slate-200 px-3 py-1 text-xs font-medium text-slate-600 hover:border-slate-300"
+              className="cursor-pointer rounded-full border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
             >
               Upload plan
             </label>
             <button
               onClick={clearCanvas}
-              className="rounded-full border border-transparent bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600 hover:bg-slate-200"
+              className="rounded-full border border-transparent bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200"
             >
-              Clear
+              Clear canvas
             </button>
           </div>
         </div>
 
-        <div className="mt-4 flex flex-wrap gap-3">
-          {(Object.keys(palette) as LayoutElementType[]).map((type) => (
-            <button
-              key={type}
-              onClick={() => {
-                setActiveTool(type);
-                void addElement(type);
-              }}
-              className={clsx(
-                'rounded-full px-4 py-2 text-sm font-medium capitalize',
-                activeTool === type
-                  ? 'bg-[var(--accent)] text-white'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200',
+        <div className="mt-5 grid gap-4 lg:grid-cols-[2fr_1fr]">
+          <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
+            <p className="text-xs font-semibold uppercase text-slate-500">Wall tools</p>
+            <div className="mt-2 flex flex-wrap gap-3">
+              {wallTools.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  onClick={() => selectWallTool(id)}
+                  className={clsx(
+                    'flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition',
+                    activeWallTool === id
+                      ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]'
+                      : 'border-slate-200 text-slate-600 hover:border-slate-300',
+                  )}
+                >
+                  <Icon active={activeWallTool === id} />
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-4 text-xs font-semibold uppercase text-slate-500">Doors & windows</p>
+            <div className="mt-2 flex flex-wrap gap-3">
+              {(['door', 'window'] as const).map((type) => (
+                <button
+                  key={type}
+                  onClick={() => {
+                    cancelDrawing();
+                    void addElement(type);
+                  }}
+                  className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300"
+                >
+                  {type === 'door' ? <DoorIcon /> : <WindowIcon />}
+                  Add {type}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-2xl border border-slate-100 bg-white p-4">
+            <p className="text-xs font-semibold uppercase text-slate-500">Canvas info</p>
+            <div className="mt-2 space-y-1 text-sm text-slate-500">
+              <p>
+                Active tool:{' '}
+                <span className="font-semibold text-slate-700">{activeWallTool}</span>
+              </p>
+              <p className="text-xs text-slate-400">
+                Polyline: click to add points, double-click to finish. Rectangle: two clicks. Arc:
+                three clicks (start, control, end). ESC or switching tools cancels the current shape.
+              </p>
+              {backdropName && (
+                <p>
+                  Background: <span className="font-semibold text-slate-700">{backdropName}</span>
+                </p>
               )}
-            >
-              Add {palette[type].label.toLowerCase()}
-            </button>
-          ))}
+              <p>
+                Elements: <span className="font-semibold text-slate-700">{elements.length}</span>
+              </p>
+              <div className="mt-3 space-y-1">
+                <label className="text-xs font-semibold uppercase text-slate-500">
+                  Wall thickness (mm)
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min={50}
+                    max={1000}
+                    step={10}
+                    value={wallThicknessMm}
+                    onChange={(event) =>
+                      onWallThicknessChange(
+                        Math.min(
+                          1000,
+                          Math.max(
+                            10,
+                            (() => {
+                              const mmValue = Number(event.target.value);
+                              return Number.isNaN(mmValue) ? defaultWallThicknessMm : mmValue;
+                            })(),
+                          ),
+                        ),
+                      )
+                    }
+                    className="w-28 rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+                  />
+                  <span className="text-xs text-slate-400">
+                    ≈ {Math.round(thicknessPx)} px
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div ref={wrapperRef} className="mt-4 rounded-2xl border border-slate-100 bg-slate-50 p-2">
-          <canvas ref={canvasRef} className="block w-full rounded-2xl bg-white" />
+        <div
+          ref={wrapperRef}
+          className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
+        >
+          <canvas ref={canvasRef} className="block w-full rounded-2xl bg-white min-h-[420px]" />
         </div>
-
-        {backdropName && (
-          <p className="mt-2 text-xs text-slate-500">
-            Background: <span className="font-medium text-slate-600">{backdropName}</span>
-          </p>
-        )}
       </div>
 
       <div className="rounded-3xl bg-white p-6 shadow-sm">
