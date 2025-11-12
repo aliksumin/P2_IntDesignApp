@@ -26,6 +26,7 @@ import type {
 } from '@/types/layout';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import type { Rect as KonvaRect } from 'konva/lib/shapes/Rect';
+import type { Line as KonvaLine } from 'konva/lib/shapes/Line';
 
 const layoutMetaSchema = z.object({
   layoutName: z.string().min(2, 'Name is required'),
@@ -121,6 +122,7 @@ const defaultColor = '#111111';
 const defaultWallThicknessMm = 200;
 const UNDO_HISTORY_LIMIT = 50;
 const OPENING_SNAP_DISTANCE = 40;
+const WALL_SNAP_THRESHOLD = 16;
 type Point = { x: number; y: number };
 
 const flattenPoints = (points: Point[]) =>
@@ -145,6 +147,7 @@ const boundsFromPoints = (points: Point[]) => {
 };
 
 const mmToPx = (mm: number) => Math.max(4, mm / 10);
+const pxToMm = (px: number) => Math.round(px * 10);
 
 const sampleQuadraticPoints = (start: Point, control: Point, end: Point, segments = 24) => {
   const safeSegments = Math.max(2, segments);
@@ -1054,8 +1057,8 @@ function LayoutStage({
 
   const commitOpeningSnap = useCallback(
     (opening: PendingOpening | null, snap: SnapResult, existing?: LayoutElement) => {
-      const openingWidth = opening?.width ?? existing?.width ?? 0;
-      const openingHeight = opening?.height ?? existing?.height ?? 0;
+          const openingWidth = opening?.width ?? existing?.width ?? 0;
+          const openingHeight = opening?.height ?? existing?.height ?? 0;
       if (!openingWidth || !openingHeight) return false;
       if (!elements.some((element) => element.id === snap.wallId)) return false;
       const elementType = opening?.type ?? existing?.type ?? 'door';
@@ -1093,12 +1096,12 @@ function LayoutStage({
           return updated;
         }
         const count = current.filter((element) => element.type === elementType).length + 1;
-        const openingElement: LayoutElement = {
-          id: generateId(),
-          type: elementType,
-          label: `${labelBase} ${count}`,
-          width: openingWidth,
-          height: openingHeight,
+          const openingElement: LayoutElement = {
+            id: generateId(),
+            type: elementType,
+            label: `${labelBase} ${count}`,
+            width: openingWidth,
+            height: openingHeight,
           left,
           top,
           angle,
@@ -1111,10 +1114,11 @@ function LayoutStage({
             y: top,
             angle,
             wallId: snap.wallId,
-            distanceAlongPath: snap.distanceAlongPath,
-            wallPathLength: snap.pathLength,
-          },
-        };
+              distanceAlongPath: snap.distanceAlongPath,
+              wallPathLength: snap.pathLength,
+              heightMm: opening?.height ?? existing?.geometry?.heightMm ?? pxToMm(openingHeight),
+            },
+          };
         return [...current, openingElement];
       });
     },
@@ -1137,6 +1141,39 @@ function LayoutStage({
   const wallElements = useMemo(
     () => elements.filter((element) => element.type === 'wall' && element.geometry),
     [elements],
+  );
+  const wallSnapRefs = useMemo(
+    () =>
+      wallElements.flatMap((wall) => {
+        const path = getWallPathPoints(wall);
+        if (path.length < 2) return [];
+        return [
+          { wallId: wall.id, point: path[0] },
+          { wallId: wall.id, point: path[path.length - 1] },
+        ];
+      }),
+    [wallElements],
+  );
+  const wallSnapPoints = useMemo(
+    () => wallSnapRefs.map((ref) => ref.point),
+    [wallSnapRefs],
+  );
+  const getSnappedPoint = useCallback(
+    (point: Point, anchor?: Point, extraPoints: Point[] = []) => {
+      const basePoint = anchor ? applyOrthoPoint(point, anchor) : point;
+      const candidates = wallSnapPoints.concat(extraPoints);
+      let closest = basePoint;
+      let bestDistance = WALL_SNAP_THRESHOLD;
+      candidates.forEach((candidate) => {
+        const dist = distanceBetween(basePoint, candidate);
+        if (dist < bestDistance) {
+          bestDistance = dist;
+          closest = candidate;
+        }
+      });
+      return closest;
+    },
+    [applyOrthoPoint, wallSnapPoints],
   );
   const elementLabels = useMemo(() => {
     const map = new Map<string, string>();
@@ -1279,8 +1316,15 @@ function LayoutStage({
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        if (pendingOpening) {
+          cancelPendingOpening();
+          return;
+        }
+        if (draft?.mode === 'polyline' && draft.points.length > 1) {
+          setDraft({ mode: 'polyline', points: draft.points.slice(0, -1) });
+          return;
+        }
         cancelDrawing();
-        cancelPendingOpening();
         return;
       }
       if ((event.key === 'Enter' || event.key === 'Return') && draft?.mode === 'polyline') {
@@ -1302,6 +1346,7 @@ function LayoutStage({
     draft,
     cancelDrawing,
     cancelPendingOpening,
+    pendingOpening,
     finalizePolyline,
     deleteSelected,
     selectedElementId,
@@ -1358,7 +1403,9 @@ function LayoutStage({
       if (activeWallTool === 'polyline') {
         const anchor =
           draft && draft.mode === 'polyline' ? draft.points[draft.points.length - 1] : undefined;
-        const snappedPoint = anchor ? applyOrthoPoint(point, anchor) : point;
+        const extra =
+          draft && draft.mode === 'polyline' && draft.points.length > 0 ? [draft.points[0]] : [];
+        const snappedPoint = getSnappedPoint(point, anchor, extra);
         if (!draft || draft.mode !== 'polyline') {
           setDraft({ mode: 'polyline', points: [snappedPoint] });
         } else {
@@ -1390,11 +1437,11 @@ function LayoutStage({
     },
     [
       activeWallTool,
-      applyOrthoPoint,
       draft,
       finalizeArc,
       finalizePendingOpening,
       finalizeRectangle,
+      getSnappedPoint,
       interactionMode,
       pendingOpening,
       pendingSnap,
@@ -1542,17 +1589,77 @@ function LayoutStage({
     [applyElementsChange, selectedElementId],
   );
 
+  const applyWallTranslation = useCallback(
+    (wallId: string, dx: number, dy: number) => {
+      if (dx === 0 && dy === 0) return false;
+      return applyElementsChange(
+        (current) => {
+          const index = current.findIndex((element) => element.id === wallId);
+          if (index === -1) return null;
+          const wall = current[index];
+          if (!wall.geometry || wall.geometry.kind === 'opening') return null;
+          const pathPoints = getWallPathPoints(wall);
+          if (pathPoints.length < 2) return null;
+          let translated = pathPoints.map((point) => ({
+            x: point.x + dx,
+            y: point.y + dy,
+          }));
+          const otherRefs = wallSnapRefs.filter((ref) => ref.wallId !== wallId);
+          if (otherRefs.length > 0) {
+            const endpoints = [translated[0], translated[translated.length - 1]];
+            let adjustX = 0;
+            let adjustY = 0;
+            let best = WALL_SNAP_THRESHOLD;
+            otherRefs.forEach(({ point }) => {
+              endpoints.forEach((endpoint) => {
+                const dist = distanceBetween(endpoint, point);
+                if (dist < best) {
+                  best = dist;
+                  adjustX = point.x - endpoint.x;
+                  adjustY = point.y - endpoint.y;
+                }
+              });
+            });
+            if (best < WALL_SNAP_THRESHOLD) {
+              translated = translated.map((pt) => ({
+                x: pt.x + adjustX,
+                y: pt.y + adjustY,
+              }));
+            }
+          }
+          const bounds = boundsFromPoints(translated);
+          const updated: LayoutElement = {
+            ...wall,
+            left: bounds.left,
+            top: bounds.top,
+            width: bounds.width,
+            height: bounds.height,
+            geometry: {
+              kind: 'polyline',
+              points: flattenPoints(translated),
+            },
+          };
+          const copy = [...current];
+          copy[index] = updated;
+          return copy;
+        },
+        { preserveSelectionId: wallId },
+      );
+    },
+    [applyElementsChange, wallSnapRefs],
+  );
+
   const describeElement = useCallback(
     (element: LayoutElement) => {
       if (!element.geometry) {
-        return `${Math.round(element.width)}x${Math.round(element.height)} px`;
+        return `${pxToMm(element.width)}x${pxToMm(element.height)} mm`;
       }
       if (element.geometry.kind === 'opening') {
         const host =
           (element.geometry.wallId && elementLabels.get(element.geometry.wallId)) || 'wall';
-        return `${Math.round(element.geometry.width)}x${Math.round(
-          element.geometry.height,
-        )} px | ${host}`;
+        const heightMm =
+          element.geometry.heightMm ?? pxToMm(element.geometry.height);
+        return `${pxToMm(element.geometry.width)}x${heightMm} mm | ${host}`;
       }
       if (element.geometry.kind === 'polyline') {
         const segments = Math.max(1, element.geometry.points.length / 2 - 1);
@@ -1561,7 +1668,7 @@ function LayoutStage({
         } mm${element.materialName ? ` | ${element.materialName}` : ''}`;
       }
       if (element.geometry.kind === 'rectangle') {
-        return `${Math.round(element.width)}x${Math.round(element.height)} px | ${
+        return `${pxToMm(element.width)}x${pxToMm(element.height)} mm | ${
           element.thicknessMm ?? wallThicknessMm
         } mm${element.materialName ? ` | ${element.materialName}` : ''}`;
       }
@@ -1570,7 +1677,7 @@ function LayoutStage({
           element.materialName ? ` | ${element.materialName}` : ''
         }`;
       }
-      return `${Math.round(element.width)}x${Math.round(element.height)} px`;
+      return `${pxToMm(element.width)}x${pxToMm(element.height)} mm`;
     },
     [elementLabels, wallThicknessMm],
   );
@@ -1604,7 +1711,22 @@ function LayoutStage({
         lineCap="round"
         lineJoin="round"
         listening={listening}
+        draggable={listening}
         onMouseDown={selectionHandler}
+        onDragStart={(evt) => {
+          if (!listening) {
+            evt.target.stopDrag();
+            return;
+          }
+          setSelectedElementId(element.id);
+        }}
+        onDragEnd={(evt) => {
+          const node = evt.target as KonvaLine;
+          const dx = node.x();
+          const dy = node.y();
+          node.position({ x: 0, y: 0 });
+          void applyWallTranslation(element.id, dx, dy);
+        }}
       />
     ));
   });
@@ -1682,7 +1804,8 @@ function LayoutStage({
       />
     ) : null;
 
-  const showPropertiesPanel = interactionMode === 'draw' || Boolean(selectedElement);
+  const showPropertiesPanel =
+    interactionMode === 'draw' || Boolean(selectedElement) || Boolean(pendingOpening);
 
   const handleDefaultThicknessChange = (value: number) => {
     if (Number.isNaN(value)) return;
@@ -1713,32 +1836,103 @@ function LayoutStage({
     }));
   };
 
-  const handleOpeningDimensionUpdate = (dimension: 'width' | 'height', value: number) => {
-    if (Number.isNaN(value)) return;
+  const handleOpeningDimensionUpdate = (dimension: 'width' | 'height', valueMm: number) => {
+    if (Number.isNaN(valueMm)) return;
     updateSelectedElement((current) => {
       if (current.geometry?.kind !== 'opening') return null;
-      const newValue = Math.max(10, value);
-      const targetWidth = dimension === 'width' ? newValue : current.width;
-      const targetHeight = dimension === 'height' ? newValue : current.height;
-      const center = getOpeningCenter(current);
+      if (dimension === 'width') {
+        const pxValue = Math.max(2, valueMm / 10);
+        const center = getOpeningCenter(current);
+        return {
+          ...current,
+          width: pxValue,
+          left: center.x - pxValue / 2,
+          top: center.y - current.height / 2,
+          geometry: {
+            ...current.geometry,
+            width: pxValue,
+            x: center.x - pxValue / 2,
+            y: center.y - current.height / 2,
+          },
+        };
+      }
+      // Height is informative only; store the mm value on geometry for display.
       return {
         ...current,
-        width: targetWidth,
-        height: targetHeight,
-        left: center.x - targetWidth / 2,
-        top: center.y - targetHeight / 2,
         geometry: {
           ...current.geometry,
-          width: targetWidth,
-          height: targetHeight,
-          x: center.x - targetWidth / 2,
-          y: center.y - targetHeight / 2,
+          heightMm: valueMm,
         },
       };
     });
   };
 
   const propertiesPanelContent = (() => {
+    if (pendingOpening) {
+      return (
+          <>
+            <p className="text-xs font-semibold uppercase text-slate-500">
+              {pendingOpening.type === 'door' ? 'Door' : 'Window'} placement
+            </p>
+            <p className="text-sm text-slate-600">
+            Move your cursor over a wall to preview snapping. Click to confirm, or press ESC to
+            cancel.
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+            <label className="text-xs font-semibold uppercase text-slate-500">
+              Width (mm)
+              <input
+                type="number"
+                min={20}
+                value={pxToMm(pendingOpening.width)}
+                onChange={(event) =>
+                  setPendingOpening((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          width: Math.max(20, (Number(event.target.value) || 20) / 10),
+                        }
+                      : prev,
+                  )
+                }
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+              />
+            </label>
+            <label className="text-xs font-semibold uppercase text-slate-500">
+              Height (mm)
+              <input
+                type="number"
+                min={20}
+                value={pxToMm(pendingOpening.height)}
+                onChange={(event) =>
+                  setPendingOpening((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          height: Math.max(20, (Number(event.target.value) || 20) / 10),
+                        }
+                      : prev,
+                  )
+                }
+                className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+              />
+            </label>
+          </div>
+          {!pendingSnap && (
+            <p className="mt-2 text-xs text-amber-600">
+              Hover over any wall to snap this opening into place.
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={cancelPendingOpening}
+            className="mt-3 w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-400"
+          >
+            Cancel placement
+          </button>
+        </>
+      );
+    }
     if (selectedElement) {
       if (selectedElement.type === 'wall') {
         const wallThicknessValue = selectedElement.thicknessMm ?? wallThicknessMm;
@@ -1791,11 +1985,11 @@ function LayoutStage({
             <p className="text-sm font-medium text-slate-800">{selectedElement.label}</p>
             <div className="space-y-3">
               <label className="block text-xs font-semibold uppercase text-slate-500">
-                Width (px)
+                Width (mm)
                 <input
                   type="number"
                   min={20}
-                  value={Math.round(selectedElement.width)}
+                  value={pxToMm(selectedElement.width)}
                   onChange={(event) =>
                     handleOpeningDimensionUpdate('width', Number(event.target.value))
                   }
@@ -1803,11 +1997,11 @@ function LayoutStage({
                 />
               </label>
               <label className="block text-xs font-semibold uppercase text-slate-500">
-                Height (px)
+                Height (mm)
                 <input
                   type="number"
                   min={20}
-                  value={Math.round(selectedElement.height)}
+                  value={pxToMm(selectedElement.height)}
                   onChange={(event) =>
                     handleOpeningDimensionUpdate('height', Number(event.target.value))
                   }
@@ -1890,7 +2084,9 @@ function LayoutStage({
     if (draft.mode === 'polyline') {
       const staticPoints = flattenPoints(draft.points);
       const anchor = draft.points[draft.points.length - 1];
-      const previewTarget = pointer && anchor ? applyOrthoPoint(pointer, anchor) : pointer;
+      const extra = draft.points.length ? [draft.points[0]] : [];
+      const previewTarget =
+        pointer && anchor ? getSnappedPoint(pointer, anchor, extra) : pointer;
       const previewPoints = previewTarget
         ? [...staticPoints, previewTarget.x, previewTarget.y]
         : staticPoints;

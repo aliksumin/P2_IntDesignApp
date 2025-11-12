@@ -15,6 +15,7 @@ export type OpeningGeometry = {
   wallId?: string;
   distanceAlongPath?: number;
   wallPathLength?: number;
+  heightMm?: number;
 };
 
 export type LayoutGeometry = WallGeometry | OpeningGeometry;
