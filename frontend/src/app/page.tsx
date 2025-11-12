@@ -23,7 +23,6 @@ import type {
   LayoutElement,
   LayoutElementType,
   WallGeometry,
-  OpeningGeometry,
 } from '@/types/layout';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import type { Rect as KonvaRect } from 'konva/lib/shapes/Rect';
@@ -190,6 +189,8 @@ const getWallPathPoints = (element: LayoutElement): Point[] => {
   return [];
 };
 
+const distanceBetween = (a: Point, b: Point) => Math.hypot(b.x - a.x, b.y - a.y);
+
 const closestPointOnSegment = (point: Point, start: Point, end: Point) => {
   const dx = end.x - start.x;
   const dy = end.y - start.y;
@@ -198,28 +199,152 @@ const closestPointOnSegment = (point: Point, start: Point, end: Point) => {
   const closest = { x: start.x + t * dx, y: start.y + t * dy };
   const distance = Math.hypot(point.x - closest.x, point.y - closest.y);
   const angle = Math.atan2(dy, dx);
-  return { closest, distance, angle };
+  return { closest, distance, angle, t };
 };
 
-type SnapResult = { point: Point; angle: number; wallId: string };
+const splitPathAtLength = (points: Point[], target: number) => {
+  if (points.length === 0) {
+    return { prefix: [], remainder: [] as Point[] };
+  }
+  if (target <= 0) {
+    return { prefix: [points[0]], remainder: [...points] };
+  }
+  const prefix: Point[] = [points[0]];
+  let remaining = target;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const start = points[i];
+    const end = points[i + 1];
+    const segLen = distanceBetween(start, end);
+    if (segLen === 0) {
+      continue;
+    }
+    if (remaining < segLen) {
+      const ratio = remaining / segLen;
+      const newPoint = {
+        x: start.x + ratio * (end.x - start.x),
+        y: start.y + ratio * (end.y - start.y),
+      };
+      prefix.push(newPoint);
+      return {
+        prefix,
+        remainder: [newPoint, ...points.slice(i + 1)],
+      };
+    }
+    if (remaining === segLen) {
+      prefix.push(end);
+      return {
+        prefix,
+        remainder: [...points.slice(i + 1)],
+      };
+    }
+    remaining -= segLen;
+    prefix.push(end);
+  }
+  return { prefix: [...points], remainder: [points[points.length - 1]] };
+};
+
+const normalizePath = (points: Point[]) => {
+  const result: Point[] = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const current = points[i];
+    const prev = result[result.length - 1];
+    if (!prev || prev.x !== current.x || prev.y !== current.y) {
+      result.push(current);
+    }
+  }
+  return result;
+};
+
+const getPathLength = (points: Point[]) => {
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    total += distanceBetween(points[i], points[i + 1]);
+  }
+  return total;
+};
+
+const extractPathSection = (points: Point[], start: number, end: number) => {
+  if (end <= start) return [];
+  const { remainder } = splitPathAtLength(points, start);
+  const { prefix } = splitPathAtLength(remainder, end - start);
+  return prefix;
+};
+
+type SnapResult = {
+  point: Point;
+  angle: number;
+  wallId: string;
+  pathPoints: Point[];
+  pathLength: number;
+  distanceAlongPath: number;
+};
 
 const findSnapPointOnWalls = (point: Point, walls: LayoutElement[]): SnapResult | null => {
   let best: SnapResult | null = null;
   let bestDistance = Number.POSITIVE_INFINITY;
   walls.forEach((wall) => {
     const path = getWallPathPoints(wall);
+    if (path.length < 2) return;
+    let cumulative = 0;
+    let totalLength = 0;
     for (let i = 0; i < path.length - 1; i += 1) {
-      const { closest, distance, angle } = closestPointOnSegment(point, path[i], path[i + 1]);
+      totalLength += distanceBetween(path[i], path[i + 1]);
+    }
+    for (let i = 0; i < path.length - 1; i += 1) {
+      const segmentLength = distanceBetween(path[i], path[i + 1]);
+      if (segmentLength === 0) continue;
+      const { closest, distance, angle, t } = closestPointOnSegment(point, path[i], path[i + 1]);
       if (distance < bestDistance) {
         bestDistance = distance;
-        best = { point: closest, angle: (angle * 180) / Math.PI, wallId: wall.id };
+        best = {
+          point: closest,
+          angle: (angle * 180) / Math.PI,
+          wallId: wall.id,
+          pathPoints: path,
+          pathLength: totalLength,
+          distanceAlongPath: cumulative + t * segmentLength,
+        };
       }
+      cumulative += segmentLength;
     }
   });
   if (!best || bestDistance > OPENING_SNAP_DISTANCE) {
     return null;
   }
   return best;
+};
+
+const subtractIntervalsFromPath = (points: Point[], intervals: { start: number; end: number }[]) => {
+  if (intervals.length === 0) {
+    return [normalizePath(points)];
+  }
+  const totalLength = getPathLength(points);
+  if (totalLength === 0) return [];
+  const normalizedIntervals = intervals
+    .map(({ start, end }) => ({
+      start: Math.max(0, Math.min(start, totalLength)),
+      end: Math.max(0, Math.min(end, totalLength)),
+    }))
+    .filter(({ end, start }) => end > start)
+    .sort((a, b) => a.start - b.start);
+  const segments: Point[][] = [];
+  let cursor = 0;
+  normalizedIntervals.forEach(({ start, end }) => {
+    if (start > cursor) {
+      const segment = extractPathSection(points, cursor, start);
+      if (segment.length >= 2) {
+        segments.push(normalizePath(segment));
+      }
+    }
+    cursor = Math.max(cursor, end);
+  });
+  if (cursor < totalLength) {
+    const finalSegment = extractPathSection(points, cursor, totalLength);
+    if (finalSegment.length >= 2) {
+      segments.push(normalizePath(finalSegment));
+    }
+  }
+  return segments;
 };
 
 const getOpeningCenter = (element: LayoutElement) => ({
@@ -800,6 +925,15 @@ type DraftState =
   | { mode: 'arc'; points: Point[] }
   | null;
 
+type PendingOpening =
+  | {
+      type: Exclude<LayoutElementType, 'wall'>;
+      width: number;
+      height: number;
+      label: string;
+    }
+  | null;
+
 function LayoutStage({
   layoutName,
   ceilingHeight,
@@ -821,6 +955,10 @@ function LayoutStage({
   const [interactionMode, setInteractionMode] = useState<'draw' | 'select'>('draw');
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [orthoMode, setOrthoMode] = useState(true);
+  const [pendingOpening, setPendingOpening] = useState<PendingOpening>(null);
+  const [pendingSnap, setPendingSnap] = useState<SnapResult | null>(null);
+  const [defaultWallColor, setDefaultWallColor] = useState(defaultColor);
+  const [defaultWallMaterial, setDefaultWallMaterial] = useState('Generic wall');
   const historyRef = useRef<LayoutElement[][]>([]);
   const [historySize, setHistorySize] = useState(0);
   const canUndo = historySize > 0;
@@ -831,6 +969,12 @@ function LayoutStage({
   const cancelDrawing = useCallback(() => {
     setDraft(null);
     setPointer(null);
+    setPendingSnap(null);
+  }, []);
+
+  const cancelPendingOpening = useCallback(() => {
+    setPendingOpening(null);
+    setPendingSnap(null);
   }, []);
 
   useLayoutEffect(() => {
@@ -909,43 +1053,83 @@ function LayoutStage({
   }, [applyElementsChange, selectedElementId]);
 
   const commitOpeningSnap = useCallback(
-    (elementId: string, snap: SnapResult) => {
-      const target = elements.find(
-        (element) => element.id === elementId && element.geometry?.kind === 'opening',
-      );
-      if (!target) return false;
-      const { point, angle, wallId } = snap;
-      const left = point.x - target.width / 2;
-      const top = point.y - target.height / 2;
-      return applyElementsChange(
-        (current) => {
-          const idx = current.findIndex((element) => element.id === elementId);
+    (opening: PendingOpening | null, snap: SnapResult, existing?: LayoutElement) => {
+      const openingWidth = opening?.width ?? existing?.width ?? 0;
+      const openingHeight = opening?.height ?? existing?.height ?? 0;
+      if (!openingWidth || !openingHeight) return false;
+      if (!elements.some((element) => element.id === snap.wallId)) return false;
+      const elementType = opening?.type ?? existing?.type ?? 'door';
+      const labelBase =
+        opening?.label ??
+        (existing?.label ? existing.label.replace(/\s+\d+$/, '') : elementType === 'door' ? 'Door' : 'Window');
+      const { point, angle } = snap;
+      const left = point.x - openingWidth / 2;
+      const top = point.y - openingHeight / 2;
+      return applyElementsChange((current) => {
+        if (!current.some((element) => element.id === snap.wallId)) {
+          return null;
+        }
+        if (existing) {
+          const idx = current.findIndex((element) => element.id === existing.id);
           if (idx === -1) return null;
           const updated = [...current];
           updated[idx] = {
-            ...current[idx],
+            ...existing,
             left,
             top,
             angle,
             geometry: {
               kind: 'opening',
-              width: target.width,
-              height: target.height,
+              width: openingWidth,
+              height: openingHeight,
               x: left,
               y: top,
               angle,
-              wallId,
-            } satisfies OpeningGeometry,
+              wallId: snap.wallId,
+              distanceAlongPath: snap.distanceAlongPath,
+              wallPathLength: snap.pathLength,
+            },
           };
           return updated;
-        },
-        { preserveSelectionId: elementId },
-      );
+        }
+        const count = current.filter((element) => element.type === elementType).length + 1;
+        const openingElement: LayoutElement = {
+          id: generateId(),
+          type: elementType,
+          label: `${labelBase} ${count}`,
+          width: openingWidth,
+          height: openingHeight,
+          left,
+          top,
+          angle,
+          fill: palette[elementType].fill,
+          geometry: {
+            kind: 'opening',
+            width: openingWidth,
+            height: openingHeight,
+            x: left,
+            y: top,
+            angle,
+            wallId: snap.wallId,
+            distanceAlongPath: snap.distanceAlongPath,
+            wallPathLength: snap.pathLength,
+          },
+        };
+        return [...current, openingElement];
+      });
     },
     [applyElementsChange, elements],
   );
 
-  const stageCursor = interactionMode === 'select' ? 'pointer' : isDrawing ? 'crosshair' : 'cell';
+  const stageCursor = pendingOpening
+    ? pendingSnap
+      ? 'crosshair'
+      : 'not-allowed'
+    : interactionMode === 'select'
+      ? 'pointer'
+      : isDrawing
+        ? 'crosshair'
+        : 'cell';
   const selectedElement = useMemo(
     () => elements.find((element) => element.id === selectedElementId) ?? null,
     [elements, selectedElementId],
@@ -961,6 +1145,26 @@ function LayoutStage({
     });
     return map;
   }, [elements]);
+  const openingsByWall = useMemo(() => {
+    const map = new Map<string, { start: number; end: number }[]>();
+    elements.forEach((element) => {
+      if (element.geometry?.kind !== 'opening') return;
+      if (typeof element.geometry.distanceAlongPath !== 'number') return;
+      const width = element.width;
+      const wallId = element.geometry.wallId;
+      if (!wallId) return;
+      const start = Math.max(0, element.geometry.distanceAlongPath - width / 2);
+      const end = element.geometry.distanceAlongPath + width / 2;
+      const list = map.get(wallId) ?? [];
+      list.push({ start, end });
+      map.set(wallId, list);
+    });
+    map.forEach((intervals, wallId) => {
+      intervals.sort((a, b) => a.start - b.start);
+      map.set(wallId, intervals);
+    });
+    return map;
+  }, [elements]);
   const canDelete = Boolean(selectedElementId);
 
   const handleShapeSelect = useCallback(
@@ -971,6 +1175,16 @@ function LayoutStage({
     },
     [interactionMode],
   );
+
+  const finalizePendingOpening = useCallback(() => {
+    if (!pendingOpening || !pendingSnap) return false;
+    const success = commitOpeningSnap(pendingOpening, pendingSnap, undefined);
+    if (success) {
+      setPendingOpening(null);
+      setPendingSnap(null);
+    }
+    return success;
+  }, [commitOpeningSnap, pendingOpening, pendingSnap]);
 
   useEffect(
     () => () => {
@@ -998,7 +1212,8 @@ function LayoutStage({
             left: bounds.left,
             top: bounds.top,
             angle: 0,
-            fill: defaultColor,
+            fill: defaultWallColor,
+            materialName: defaultWallMaterial,
             geometry,
             thicknessMm: wallThicknessMm,
           };
@@ -1006,7 +1221,7 @@ function LayoutStage({
         return [...current, ...additions];
       });
     },
-    [applyElementsChange, wallThicknessMm],
+    [applyElementsChange, defaultWallColor, defaultWallMaterial, wallThicknessMm],
   );
 
   const finalizePolyline = useCallback(
@@ -1065,6 +1280,7 @@ function LayoutStage({
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         cancelDrawing();
+        cancelPendingOpening();
         return;
       }
       if ((event.key === 'Enter' || event.key === 'Return') && draft?.mode === 'polyline') {
@@ -1082,27 +1298,52 @@ function LayoutStage({
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [draft, cancelDrawing, finalizePolyline, deleteSelected, selectedElementId, undoLast]);
+  }, [
+    draft,
+    cancelDrawing,
+    cancelPendingOpening,
+    finalizePolyline,
+    deleteSelected,
+    selectedElementId,
+    undoLast,
+  ]);
 
-  const handleMouseMove = useCallback((event: KonvaEventObject<MouseEvent>) => {
-    const stage = event.target.getStage();
-    if (!stage) return;
-    const position = stage.getPointerPosition();
-    if (!position) {
-      setPointer(null);
-      return;
-    }
-    setPointer({ x: position.x, y: position.y });
-  }, []);
+  const handleMouseMove = useCallback(
+    (event: KonvaEventObject<MouseEvent>) => {
+      const stage = event.target.getStage();
+      if (!stage) return;
+      const position = stage.getPointerPosition();
+      if (!position) {
+        setPointer(null);
+        if (pendingOpening) {
+          setPendingSnap(null);
+        }
+        return;
+      }
+      const point = { x: position.x, y: position.y };
+      setPointer(point);
+      if (pendingOpening) {
+        setPendingSnap(findSnapPointOnWalls(point, wallElements));
+      }
+    },
+    [pendingOpening, wallElements],
+  );
 
   const handleMouseLeave = useCallback(() => {
     setPointer(null);
+    setPendingSnap(null);
   }, []);
 
   const handleStageMouseDown = useCallback(
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
       if (!stage) return;
+      if (pendingOpening) {
+        if (pendingSnap) {
+          void finalizePendingOpening();
+        }
+        return;
+      }
       if (interactionMode === 'select') {
         if (event.target === stage) {
           setSelectedElementId(null);
@@ -1147,19 +1388,29 @@ function LayoutStage({
         }
       }
     },
-    [activeWallTool, applyOrthoPoint, draft, finalizeArc, finalizeRectangle, interactionMode],
+    [
+      activeWallTool,
+      applyOrthoPoint,
+      draft,
+      finalizeArc,
+      finalizePendingOpening,
+      finalizeRectangle,
+      interactionMode,
+      pendingOpening,
+      pendingSnap,
+    ],
   );
 
   const handleDoubleClick = useCallback(
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
-      if (!stage || event.target !== stage || interactionMode !== 'draw') return;
+      if (!stage || event.target !== stage || interactionMode !== 'draw' || pendingOpening) return;
       if (draft?.mode === 'polyline') {
         finalizePolyline(draft.points);
         setDraft(null);
       }
     },
-    [draft, finalizePolyline, interactionMode],
+    [draft, finalizePolyline, interactionMode, pendingOpening],
   );
 
   const handleBackdrop = useCallback(
@@ -1167,6 +1418,7 @@ function LayoutStage({
       const file = event.target.files?.[0];
       if (!file) return;
       cancelDrawing();
+      cancelPendingOpening();
       const url = URL.createObjectURL(file);
       if (backdropUrlRef.current) {
         URL.revokeObjectURL(backdropUrlRef.current);
@@ -1175,11 +1427,12 @@ function LayoutStage({
       setBackdropSrc(url);
       setBackdropName(file.name);
     },
-    [cancelDrawing],
+    [cancelDrawing, cancelPendingOpening],
   );
 
   const clearCanvas = useCallback(() => {
     cancelDrawing();
+    cancelPendingOpening();
     applyElementsChange((current) => (current.length === 0 ? null : []));
     setBackdropName(null);
     if (backdropUrlRef.current) {
@@ -1187,7 +1440,7 @@ function LayoutStage({
       backdropUrlRef.current = null;
     }
     setBackdropSrc(null);
-  }, [applyElementsChange, cancelDrawing]);
+  }, [applyElementsChange, cancelDrawing, cancelPendingOpening]);
 
   const formValues = useMemo(
     () => ({
@@ -1214,6 +1467,7 @@ function LayoutStage({
   const selectWallTool = (tool: WallToolId) => {
     if (tool === activeWallTool && interactionMode === 'draw') return;
     cancelDrawing();
+    cancelPendingOpening();
     setInteractionMode('draw');
     setActiveWallTool(tool);
   };
@@ -1221,6 +1475,7 @@ function LayoutStage({
   const addOpeningElement = useCallback(
     (type: Exclude<LayoutElementType, 'wall'>) => {
       cancelDrawing();
+      cancelPendingOpening();
       const walls = wallElements;
       if (walls.length === 0) {
         console.warn('Draw walls before placing doors or windows.');
@@ -1229,63 +1484,62 @@ function LayoutStage({
       const desiredCenter = { x: stageSize.width / 2, y: stageSize.height / 2 };
       const snap = findSnapPointOnWalls(desiredCenter, walls);
       if (!snap) {
-        console.warn('No nearby wall found for placing the opening.');
-        return;
+        console.info('Move the cursor near a wall to place the opening.');
       }
-      const { point, angle, wallId } = snap;
-      const { label, fill, width, height } = palette[type];
-      const left = point.x - width / 2;
-      const top = point.y - height / 2;
-      applyElementsChange((current) => {
-        const count = current.filter((element) => element.type === type).length + 1;
-        const next: LayoutElement = {
-          id: generateId(),
-          type,
-          label: `${label} ${count}`,
-          width,
-          height,
-          left,
-          top,
-          angle,
-          fill,
-          geometry: {
-            kind: 'opening',
-            width,
-            height,
-            x: left,
-            y: top,
-            angle,
-            wallId,
-          },
-        };
-        return [...current, next];
+      const { width, height, label } = palette[type];
+      setPendingOpening({
+        type,
+        width,
+        height,
+        label,
       });
+      setPendingSnap(snap ?? null);
     },
-    [applyElementsChange, cancelDrawing, stageSize.height, stageSize.width, wallElements],
+    [cancelDrawing, cancelPendingOpening, stageSize.height, stageSize.width, wallElements],
   );
 
   const handleOpeningDrag = useCallback(
-    (element: LayoutElement, position: Point, revert: () => void, node?: Konva.Rect) => {
+    (element: LayoutElement, position: Point, revert: () => void, node?: KonvaRect) => {
       if (element.geometry?.kind !== 'opening') {
         revert();
-        return;
+        return false;
       }
       const snap = findSnapPointOnWalls(position, wallElements);
       if (!snap) {
         revert();
-        return;
+        return false;
       }
-      const updated = commitOpeningSnap(element.id, snap);
+      const updated = commitOpeningSnap(null, snap, element);
       if (!updated) {
         revert();
-        return;
+        return false;
       }
       if (node) {
-        node.position(snap.point);
+        node.position({ x: snap.point.x, y: snap.point.y });
         node.rotation(snap.angle);
       }
+      return true;
     },
     [commitOpeningSnap, wallElements],
+  );
+
+  const updateSelectedElement = useCallback(
+    (updater: (current: LayoutElement) => LayoutElement | null) => {
+      if (!selectedElementId) return false;
+      return applyElementsChange(
+        (current) => {
+          const index = current.findIndex((element) => element.id === selectedElementId);
+          if (index === -1) return null;
+          const updated = updater(current[index]);
+          if (!updated) return null;
+          const next = [...current];
+          next[index] = updated;
+          return next;
+        },
+        { preserveSelectionId: selectedElementId },
+      );
+    },
+    [applyElementsChange, selectedElementId],
   );
 
   const describeElement = useCallback(
@@ -1304,24 +1558,29 @@ function LayoutStage({
         const segments = Math.max(1, element.geometry.points.length / 2 - 1);
         return `${segments} segment${segments > 1 ? 's' : ''} | ${
           element.thicknessMm ?? wallThicknessMm
-        } mm`;
+        } mm${element.materialName ? ` | ${element.materialName}` : ''}`;
       }
       if (element.geometry.kind === 'rectangle') {
         return `${Math.round(element.width)}x${Math.round(element.height)} px | ${
           element.thicknessMm ?? wallThicknessMm
-        } mm`;
+        } mm${element.materialName ? ` | ${element.materialName}` : ''}`;
       }
       if (element.geometry.kind === 'arc') {
-        return `Arc | ${element.thicknessMm ?? wallThicknessMm} mm`;
+        return `Arc | ${element.thicknessMm ?? wallThicknessMm} mm${
+          element.materialName ? ` | ${element.materialName}` : ''
+        }`;
       }
       return `${Math.round(element.width)}x${Math.round(element.height)} px`;
     },
     [elementLabels, wallThicknessMm],
   );
 
-  const wallShapes = elements.map((element) => {
-    const geometry = element.geometry;
-    if (!geometry || geometry.kind === 'opening') return null;
+  const wallShapes = elements.flatMap((element) => {
+    if (element.type !== 'wall' || !element.geometry || element.geometry.kind === 'opening') {
+      return [];
+    }
+    const pathPoints = getWallPathPoints(element);
+    if (pathPoints.length < 2) return [];
     const color = element.fill ?? defaultColor;
     const isSelected = element.id === selectedElementId;
     const strokeWidth = mmToPx(element.thicknessMm ?? wallThicknessMm);
@@ -1331,56 +1590,23 @@ function LayoutStage({
     const selectionHandler = listening
       ? (evt: KonvaEventObject<MouseEvent>) => handleShapeSelect(element.id, evt)
       : undefined;
-    if (geometry.kind === 'polyline') {
-      return (
-        <Line
-          key={element.id}
-          points={geometry.points}
-          stroke={strokeColor}
-          strokeWidth={effectiveStroke}
-          lineCap="round"
-          lineJoin="round"
-          listening={listening}
-          onMouseDown={selectionHandler}
-        />
-      );
+    const cutouts = openingsByWall.get(element.id) ?? [];
+    const segments = subtractIntervalsFromPath(pathPoints, cutouts);
+    if (segments.length === 0) {
+      return [];
     }
-    if (geometry.kind === 'rectangle') {
-      return (
-        <Line
-          key={element.id}
-          points={geometry.points}
-          closed
-          stroke={strokeColor}
-          strokeWidth={isSelected ? 2 : 1}
-          fill={isSelected ? 'rgba(79,70,229,0.15)' : color}
-          opacity={isSelected ? 0.9 : 0.85}
-          listening={listening}
-          onMouseDown={selectionHandler}
-        />
-      );
-    }
-    if (geometry.kind === 'arc') {
-      const [sx, sy, cx, cy, ex, ey] = geometry.points;
-      const curvePoints = sampleQuadraticPoints(
-        { x: sx, y: sy },
-        { x: cx, y: cy },
-        { x: ex, y: ey },
-      );
-      return (
-        <Line
-          key={element.id}
-          points={flattenPoints(curvePoints)}
-          stroke={strokeColor}
-          strokeWidth={effectiveStroke}
-          lineCap="round"
-          lineJoin="round"
-          listening={listening}
-          onMouseDown={selectionHandler}
-        />
-      );
-    }
-    return null;
+    return segments.map((segment, idx) => (
+      <Line
+        key={`${element.id}-${idx}`}
+        points={flattenPoints(segment)}
+        stroke={strokeColor}
+        strokeWidth={effectiveStroke}
+        lineCap="round"
+        lineJoin="round"
+        listening={listening}
+        onMouseDown={selectionHandler}
+      />
+    ));
   });
 
   const openingShapes = elements.map((element) => {
@@ -1420,14 +1646,244 @@ function LayoutStage({
         onDragEnd={(event) => {
           const node = event.target as KonvaRect;
           const revert = () => {
-            node.position(center);
+            node.position({ x: center.x, y: center.y });
             node.rotation(rotation);
           };
-          handleOpeningDrag(element, { x: node.x(), y: node.y() }, revert, node);
+          const success = handleOpeningDrag(
+            element,
+            { x: node.x(), y: node.y() },
+            revert,
+            node,
+          );
+          if (!success) {
+            revert();
+          }
         }}
       />
     );
   });
+
+  const ghostOpeningShape =
+    pendingOpening && pendingSnap ? (
+      <Rect
+        x={pendingSnap.point.x}
+        y={pendingSnap.point.y}
+        offsetX={pendingOpening.width / 2}
+        offsetY={pendingOpening.height / 2}
+        width={pendingOpening.width}
+        height={pendingOpening.height}
+        rotation={pendingSnap.angle}
+        cornerRadius={pendingOpening.type === 'door' ? 8 : 4}
+        stroke="#6366f1"
+        dash={[4, 4]}
+        strokeWidth={2}
+        fill="rgba(99,102,241,0.15)"
+        listening={false}
+      />
+    ) : null;
+
+  const showPropertiesPanel = interactionMode === 'draw' || Boolean(selectedElement);
+
+  const handleDefaultThicknessChange = (value: number) => {
+    if (Number.isNaN(value)) return;
+    const mmValue = Math.min(1000, Math.max(10, value));
+    onWallThicknessChange(mmValue);
+  };
+
+  const handleWallThicknessUpdate = (value: number) => {
+    if (Number.isNaN(value)) return;
+    const mmValue = Math.min(1000, Math.max(10, value));
+    updateSelectedElement((current) => ({
+      ...current,
+      thicknessMm: mmValue,
+    }));
+  };
+
+  const handleWallColorUpdate = (value: string) => {
+    updateSelectedElement((current) => ({
+      ...current,
+      fill: value,
+    }));
+  };
+
+  const handleWallMaterialUpdate = (value: string) => {
+    updateSelectedElement((current) => ({
+      ...current,
+      materialName: value,
+    }));
+  };
+
+  const handleOpeningDimensionUpdate = (dimension: 'width' | 'height', value: number) => {
+    if (Number.isNaN(value)) return;
+    updateSelectedElement((current) => {
+      if (current.geometry?.kind !== 'opening') return null;
+      const newValue = Math.max(10, value);
+      const targetWidth = dimension === 'width' ? newValue : current.width;
+      const targetHeight = dimension === 'height' ? newValue : current.height;
+      const center = getOpeningCenter(current);
+      return {
+        ...current,
+        width: targetWidth,
+        height: targetHeight,
+        left: center.x - targetWidth / 2,
+        top: center.y - targetHeight / 2,
+        geometry: {
+          ...current.geometry,
+          width: targetWidth,
+          height: targetHeight,
+          x: center.x - targetWidth / 2,
+          y: center.y - targetHeight / 2,
+        },
+      };
+    });
+  };
+
+  const propertiesPanelContent = (() => {
+    if (selectedElement) {
+      if (selectedElement.type === 'wall') {
+        const wallThicknessValue = selectedElement.thicknessMm ?? wallThicknessMm;
+        return (
+          <>
+            <p className="text-xs font-semibold uppercase text-slate-500">Wall properties</p>
+            <p className="text-sm font-medium text-slate-800">{selectedElement.label}</p>
+            <div className="space-y-3">
+              <label className="block text-xs font-semibold uppercase text-slate-500">
+                Thickness (mm)
+                <input
+                  type="number"
+                  min={10}
+                  max={1000}
+                  step={10}
+                  value={wallThicknessValue}
+                  onChange={(event) => handleWallThicknessUpdate(Number(event.target.value))}
+                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+                />
+              </label>
+              <label className="block text-xs font-semibold uppercase text-slate-500">
+                Color
+                <input
+                  type="color"
+                  value={selectedElement.fill ?? defaultWallColor}
+                  onChange={(event) => handleWallColorUpdate(event.target.value)}
+                  className="mt-1 h-10 w-full cursor-pointer rounded-xl border border-slate-200 bg-white"
+                />
+              </label>
+              <label className="block text-xs font-semibold uppercase text-slate-500">
+                Material
+                <input
+                  type="text"
+                  value={selectedElement.materialName ?? ''}
+                  onChange={(event) => handleWallMaterialUpdate(event.target.value)}
+                  placeholder="e.g., Gypsum board"
+                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+                />
+              </label>
+            </div>
+          </>
+        );
+      }
+      if (selectedElement.type === 'door' || selectedElement.type === 'window') {
+        return (
+          <>
+            <p className="text-xs font-semibold uppercase text-slate-500">
+              {selectedElement.type === 'door' ? 'Door' : 'Window'} properties
+            </p>
+            <p className="text-sm font-medium text-slate-800">{selectedElement.label}</p>
+            <div className="space-y-3">
+              <label className="block text-xs font-semibold uppercase text-slate-500">
+                Width (px)
+                <input
+                  type="number"
+                  min={20}
+                  value={Math.round(selectedElement.width)}
+                  onChange={(event) =>
+                    handleOpeningDimensionUpdate('width', Number(event.target.value))
+                  }
+                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+                />
+              </label>
+              <label className="block text-xs font-semibold uppercase text-slate-500">
+                Height (px)
+                <input
+                  type="number"
+                  min={20}
+                  value={Math.round(selectedElement.height)}
+                  onChange={(event) =>
+                    handleOpeningDimensionUpdate('height', Number(event.target.value))
+                  }
+                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+                />
+              </label>
+              {selectedElement.geometry?.kind === 'opening' && selectedElement.geometry.wallId && (
+                <p className="text-xs text-slate-500">
+                  Host wall:{' '}
+                  <span className="font-semibold">
+                    {elementLabels.get(selectedElement.geometry.wallId) ?? 'Wall'}
+                  </span>
+                </p>
+              )}
+            </div>
+          </>
+        );
+      }
+    }
+    return (
+      <>
+        <p className="text-xs font-semibold uppercase text-slate-500">Wall defaults</p>
+        <div className="space-y-3 text-sm">
+          <label className="block text-xs font-semibold uppercase text-slate-500">
+            Thickness (mm)
+            <input
+              type="number"
+              min={10}
+              max={1000}
+              step={10}
+              value={wallThicknessMm}
+              onChange={(event) => handleDefaultThicknessChange(Number(event.target.value))}
+              className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+            <span className="mt-1 block text-[11px] text-slate-500">
+              ≈ {Math.round(thicknessPx)} px stroke
+            </span>
+          </label>
+          <label className="block text-xs font-semibold uppercase text-slate-500">
+            Color
+            <input
+              type="color"
+              value={defaultWallColor}
+              onChange={(event) => setDefaultWallColor(event.target.value)}
+              className="mt-1 h-10 w-full cursor-pointer rounded-xl border border-slate-200 bg-white"
+            />
+          </label>
+          <label className="block text-xs font-semibold uppercase text-slate-500">
+            Material
+            <input
+              type="text"
+              value={defaultWallMaterial}
+              onChange={(event) => setDefaultWallMaterial(event.target.value)}
+              placeholder="e.g., Lime plaster"
+              className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
+            />
+          </label>
+          {pendingOpening && (
+            <button
+              type="button"
+              onClick={cancelPendingOpening}
+              className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-slate-400"
+            >
+              Cancel door/window placement
+            </button>
+          )}
+        </div>
+      </>
+    );
+  })();
+
+  const propertiesPanel = showPropertiesPanel ? (
+    <div className="pointer-events-auto absolute right-4 top-4 w-72 max-w-[calc(100%-2rem)] rounded-2xl border border-white/60 bg-white/85 p-4 text-sm text-slate-700 shadow-xl backdrop-blur">
+      {propertiesPanelContent}
+    </div>
+  ) : null;
 
   const draftShape = (() => {
     if (!draft) return null;
@@ -1547,19 +2003,21 @@ function LayoutStage({
               </div>
               <p className="mt-4 text-xs text-slate-500">
                 Polyline: click to add points, double-click or press Enter to finish. Rectangle: two
-                clicks. Arc: three clicks (start, control, end). ESC or switching tools cancels the
-                current shape. Ortho snap keeps segments horizontal/vertical by default.
+                clicks. Arc: three clicks (start, control, end). ESC cancels the active tool.
+                Selecting Door/Window spawns a preview that follows your cursor—click any wall
+                (including arcs) to snap and cut the opening with ortho-enabled wall segments.
               </p>
               <div className="mt-4 flex flex-wrap items-center gap-3">
                 {(['door', 'window'] as const).map((type) => (
                   <button
                     type="button"
                     key={type}
+                    disabled={Boolean(pendingOpening)}
                     onClick={() => {
                       setInteractionMode('draw');
                       addOpeningElement(type);
                     }}
-                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300"
+                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {type === 'door' ? <DoorIcon /> : <WindowIcon />}
                     Add {type}
@@ -1572,7 +2030,10 @@ function LayoutStage({
               <div className="mt-2 flex flex-wrap gap-2">
                 <button
                   type="button"
-                  onClick={() => setInteractionMode('draw')}
+                  onClick={() => {
+                    cancelPendingOpening();
+                    setInteractionMode('draw');
+                  }}
                   className={clsx(
                     'rounded-xl border px-3 py-2 text-sm font-medium transition',
                     interactionMode === 'draw'
@@ -1586,6 +2047,7 @@ function LayoutStage({
                   type="button"
                   onClick={() => {
                     cancelDrawing();
+                    cancelPendingOpening();
                     setInteractionMode('select');
                   }}
                   className={clsx(
@@ -1628,6 +2090,13 @@ function LayoutStage({
               </div>
               <p className="mt-2 text-xs text-slate-400">
                 Select mode lets you pick, drag, or delete existing walls, doors, and windows.
+                {pendingOpening && (
+                  <>
+                    {' '}
+                    Door/window placement is active—move the cursor over a wall and click to confirm
+                    or press ESC to cancel.
+                  </>
+                )}
               </p>
             </div>
           </div>
@@ -1667,43 +2136,13 @@ function LayoutStage({
               <p>
                 Elements: <span className="font-semibold text-slate-700">{elements.length}</span>
               </p>
-              <div className="mt-3 space-y-1">
-                <label className="text-xs font-semibold uppercase text-slate-500">
-                  Wall thickness (mm)
-                </label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="number"
-                    min={50}
-                    max={1000}
-                    step={10}
-                    value={wallThicknessMm}
-                    onChange={(event) =>
-                      onWallThicknessChange(
-                        Math.min(
-                          1000,
-                          Math.max(
-                            10,
-                            (() => {
-                              const mmValue = Number(event.target.value);
-                              return Number.isNaN(mmValue) ? defaultWallThicknessMm : mmValue;
-                            })(),
-                          ),
-                        ),
-                      )
-                    }
-                    className="w-28 rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
-                  />
-                  <span className="text-xs text-slate-400">~ {Math.round(thicknessPx)} px</span>
-                </div>
-              </div>
             </div>
           </div>
         </div>
 
         <div
           ref={wrapperRef}
-          className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
+          className="relative mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
         >
           <Stage
             width={stageSize.width}
@@ -1737,9 +2176,11 @@ function LayoutStage({
               )}
               {wallShapes}
               {openingShapes}
+              {ghostOpeningShape}
               {draftShape}
             </Layer>
           </Stage>
+          {propertiesPanel}
         </div>
       </div>
 

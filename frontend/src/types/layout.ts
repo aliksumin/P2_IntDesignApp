@@ -13,6 +13,8 @@ export type OpeningGeometry = {
   y: number;
   angle?: number;
   wallId?: string;
+  distanceAlongPath?: number;
+  wallPathLength?: number;
 };
 
 export type LayoutGeometry = WallGeometry | OpeningGeometry;
@@ -29,4 +31,5 @@ export type LayoutElement = {
   fill: string;
   geometry?: LayoutGeometry;
   thicknessMm?: number;
+  materialName?: string;
 };
