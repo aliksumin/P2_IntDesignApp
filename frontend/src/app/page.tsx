@@ -6,16 +6,26 @@ import {
   useRef,
   useState,
   useCallback,
+  useLayoutEffect,
   type Dispatch,
   type SetStateAction,
+  type ChangeEvent,
 } from 'react';
 import clsx from 'clsx';
-import type { fabric as FabricNamespace } from 'fabric';
+import { Stage, Layer, Line, Rect, Image as KonvaImage } from 'react-konva';
+import useImage from 'use-image';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation } from '@tanstack/react-query';
 import { simulateMaterialEdit, simulateRenderRequest } from '@/lib/mockApi';
+import type {
+  LayoutElement,
+  LayoutElementType,
+  WallGeometry,
+  OpeningGeometry,
+} from '@/types/layout';
+import type { KonvaEventObject } from 'konva/lib/Node';
 
 const layoutMetaSchema = z.object({
   layoutName: z.string().min(2, 'Name is required'),
@@ -47,21 +57,6 @@ type LayoutMetaForm = z.infer<typeof layoutMetaSchema>;
 type RenderForm = z.infer<typeof renderSchema>;
 type MaterialForm = z.infer<typeof materialSchema>;
 type SettingsForm = z.infer<typeof settingsSchema>;
-type FabricStatic = typeof FabricNamespace;
-
-type LayoutElementType = 'wall' | 'door' | 'window';
-
-type LayoutElement = {
-  id: string;
-  type: LayoutElementType;
-  label: string;
-  width: number;
-  height: number;
-  left: number;
-  top: number;
-  angle: number;
-  fill: string;
-};
 
 type FurnitureSample = {
   id: string;
@@ -95,28 +90,6 @@ type ApiKeys = {
   assetStorage?: string;
 };
 
-type Point = { x: number; y: number };
-
-let fabricLoader: Promise<FabricStatic> | null = null;
-const getFabric = () => {
-  if (!fabricLoader) {
-    fabricLoader = import('fabric').then((mod) => {
-      const namespace = (mod as { fabric?: FabricStatic }).fabric;
-      if (namespace) {
-        return namespace;
-      }
-      return mod as FabricStatic;
-    });
-  }
-  return fabricLoader;
-};
-type FabricMeta = {
-  id?: string;
-  type?: LayoutElementType;
-  label?: string;
-};
-type FabricShape = fabric.Object & { data?: FabricMeta };
-
 const stepData = [
   {
     id: 1,
@@ -146,6 +119,30 @@ const initialPrompt =
 const initialStylePreset = 'natural-soft';
 const defaultColor = '#111111';
 const defaultWallThicknessMm = 200;
+type Point = { x: number; y: number };
+
+const flattenPoints = (points: Point[]) =>
+  points.flatMap((pt) => [Number(pt.x.toFixed(2)), Number(pt.y.toFixed(2))]);
+
+const boundsFromPoints = (points: Point[]) => {
+  if (points.length === 0) {
+    return { left: 0, top: 0, width: 0, height: 0 };
+  }
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
+  const width = Math.max(...xs) - left;
+  const height = Math.max(...ys) - top;
+  return {
+    left,
+    top,
+    width: Math.max(width, 1),
+    height: Math.max(height, 1),
+  };
+};
+
+const mmToPx = (mm: number) => Math.max(4, mm / 10);
 
 function PolylineIcon({ active }: { active?: boolean }) {
   return (
@@ -714,6 +711,12 @@ type LayoutStageProps = {
   onWallThicknessChange: (value: number) => void;
 };
 
+type DraftState =
+  | { mode: 'polyline'; points: Point[] }
+  | { mode: 'rectangle'; start: Point }
+  | { mode: 'arc'; points: Point[] }
+  | null;
+
 function LayoutStage({
   layoutName,
   ceilingHeight,
@@ -724,391 +727,216 @@ function LayoutStage({
   wallThicknessMm,
   onWallThicknessChange,
 }: LayoutStageProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
-  const fabricRef = useRef<fabric.Canvas | null>(null);
-  const fabricLibRef = useRef<FabricStatic | null>(null);
-  const bgUrl = useRef<string | null>(null);
+  const backdropUrlRef = useRef<string | null>(null);
+  const [stageSize, setStageSize] = useState({ width: 960, height: 540 });
+  const [draft, setDraft] = useState<DraftState>(null);
   const [activeWallTool, setActiveWallTool] = useState<WallToolId>('polyline');
   const [backdropName, setBackdropName] = useState<string | null>(null);
-  const [isDrawing, setIsDrawing] = useState(false);
-  const thicknessPx = useMemo(() => Math.max(4, wallThicknessMm / 10), [wallThicknessMm]);
-  const [canvasReady, setCanvasReady] = useState(false);
-  const elementSeedRef = useRef(0);
-  type DrawingSession =
-    | { mode: 'polyline'; points: Point[]; temp?: fabric.Object }
-    | { mode: 'rectangle'; points: Point[]; temp?: fabric.Rect }
-    | { mode: 'arc'; points: Point[]; temp?: fabric.Object };
-  const drawingSession = useRef<DrawingSession | null>(null);
-  const activeToolRef = useRef<WallToolId>('polyline');
-  useEffect(() => {
-    activeToolRef.current = activeWallTool;
-  }, [activeWallTool]);
-  const ensureFabric = useCallback(async () => {
-    if (fabricLibRef.current) {
-      return fabricLibRef.current;
-    }
-    const lib = await getFabric();
-    fabricLibRef.current = lib;
-    return lib;
+  const [backdropSrc, setBackdropSrc] = useState<string | null>(null);
+  const [pointer, setPointer] = useState<Point | null>(null);
+  const [backgroundImage] = useImage(backdropSrc ?? '');
+  const thicknessPx = useMemo(() => mmToPx(wallThicknessMm), [wallThicknessMm]);
+  const isDrawing = Boolean(draft);
+
+  const cancelDrawing = useCallback(() => {
+    setDraft(null);
+    setPointer(null);
   }, []);
 
-
-  useEffect(() => {
-    let disposed = false;
-
-    const setupCanvas = async () => {
-      const fabricLib = await ensureFabric();
-      if (disposed || !canvasRef.current) return;
-      const canvas = new fabricLib.Canvas(canvasRef.current, {
-        selection: true,
-        backgroundColor: '#f8fafc',
-      });
-      fabricRef.current = canvas;
-      canvas.hoverCursor = 'cell';
-      canvas.defaultCursor = 'cell';
-      fabricLibRef.current = fabricLib;
-      setCanvasReady(true);
-
-      const persistElements = () => {
-        const objs = canvas.getObjects();
-        const data: LayoutElement[] = objs.map((obj, index) => {
-          const fallbackId = `element-${index}`;
-          const meta = (obj as FabricShape).data ?? {};
-          return {
-            id: meta.id ?? fallbackId,
-            type: (meta.type as LayoutElementType) ?? 'wall',
-            label: meta.label ?? `Element ${index + 1}`,
-            width: obj.getScaledWidth?.() ?? obj.width ?? 0,
-            height: obj.getScaledHeight?.() ?? obj.height ?? 0,
-            left: obj.left ?? 0,
-            top: obj.top ?? 0,
-            angle: obj.angle ?? 0,
-            fill: (obj.fill as string) ?? '#0f172a',
-          };
-        });
-        onElementsChange(data);
-      };
-
-      canvas.on('object:added', persistElements);
-      canvas.on('object:modified', persistElements);
-      canvas.on('object:removed', persistElements);
-    };
-
-    setupCanvas();
-
-    return () => {
-      disposed = true;
-      fabricRef.current?.dispose();
-      fabricRef.current = null;
-      if (bgUrl.current) {
-        URL.revokeObjectURL(bgUrl.current);
-        bgUrl.current = null;
-      }
-      setCanvasReady(false);
-    };
-  }, [onElementsChange, ensureFabric]);
-
-  useEffect(() => {
+  useLayoutEffect(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
-
-    const resize = () => {
-      if (!wrapper || !canvasRef.current || !fabricRef.current) return;
-      const width = wrapper.clientWidth;
-      const height = Math.min(480, width * 0.65);
-      canvasRef.current.width = width;
-      canvasRef.current.height = height;
-      fabricRef.current.setDimensions({ width, height });
-      fabricRef.current.renderAll();
-    };
-
-    resize();
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const width = entry.contentRect.width;
+      setStageSize({
+        width,
+        height: Math.max(420, Math.round(width * 0.6)),
+      });
+    });
     observer.observe(wrapper);
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
-    if (canvasRef.current) {
-      canvasRef.current.style.cursor = isDrawing ? 'crosshair' : 'cell';
-    }
-    if (fabricRef.current) {
-      fabricRef.current.defaultCursor = isDrawing ? 'crosshair' : 'cell';
-    }
-  }, [isDrawing]);
-
-  const cancelDrawing = useCallback(() => {
-    const canvas = fabricRef.current;
-    const session = drawingSession.current;
-    if (canvas && session?.temp) {
-      canvas.remove(session.temp);
-      canvas.requestRenderAll();
-    }
-    drawingSession.current = null;
-    setIsDrawing(false);
-  }, []);
-  const computeWallPolygon = useCallback(
-    (start: Point, end: Point) => {
-      const dx = end.x - start.x;
-      const dy = end.y - start.y;
-      const length = Math.hypot(dx, dy) || 1;
-      const ux = dx / length;
-      const uy = dy / length;
-      const half = thicknessPx / 2;
-      const offsetX = -uy * half;
-      const offsetY = ux * half;
-      return [
-        { x: start.x + offsetX, y: start.y + offsetY },
-        { x: start.x - offsetX, y: start.y - offsetY },
-        { x: end.x - offsetX, y: end.y - offsetY },
-        { x: end.x + offsetX, y: end.y + offsetY },
-      ];
+  useEffect(
+    () => () => {
+      if (backdropUrlRef.current) {
+        URL.revokeObjectURL(backdropUrlRef.current);
+      }
     },
-    [thicknessPx],
+    [],
+  );
+
+  const commitWallElement = useCallback(
+    (geometry: WallGeometry, rawPoints: Point[]) => {
+      if (rawPoints.length === 0) return;
+      const bounds = boundsFromPoints(rawPoints);
+      const wallIndex = elements.filter((element) => element.type === 'wall').length + 1;
+      const next: LayoutElement = {
+        id: generateId(),
+        type: 'wall',
+        label: `Wall ${wallIndex}`,
+        width: bounds.width,
+        height: bounds.height,
+        left: bounds.left,
+        top: bounds.top,
+        angle: 0,
+        fill: defaultColor,
+        geometry,
+        thicknessMm: wallThicknessMm,
+      };
+      onElementsChange([...elements, next]);
+    },
+    [elements, onElementsChange, wallThicknessMm],
+  );
+
+  const finalizePolyline = useCallback(
+    (points: Point[]) => {
+      if (points.length < 2) return;
+      commitWallElement({ kind: 'polyline', points: flattenPoints(points) }, points);
+    },
+    [commitWallElement],
+  );
+
+  const finalizeRectangle = useCallback(
+    (start: Point, end: Point) => {
+      const width = Math.abs(end.x - start.x);
+      const height = Math.abs(end.y - start.y);
+      if (width < 2 || height < 2) return;
+      const corners = [
+        { x: start.x, y: start.y },
+        { x: end.x, y: start.y },
+        { x: end.x, y: end.y },
+        { x: start.x, y: end.y },
+      ];
+      commitWallElement({ kind: 'rectangle', points: flattenPoints(corners) }, corners);
+    },
+    [commitWallElement],
+  );
+
+  const finalizeArc = useCallback(
+    (points: Point[]) => {
+      if (points.length !== 3) return;
+      const [start, control, end] = points;
+      commitWallElement(
+        { kind: 'arc', points: [start.x, start.y, control.x, control.y, end.x, end.y] },
+        points,
+      );
+    },
+    [commitWallElement],
   );
 
   useEffect(() => {
-    if (!canvasReady) return;
-    const canvas = fabricRef.current;
-    if (!canvas) return;
-
-    const getPoint = (evt: MouseEvent): Point => {
-      const pointer = canvas.getPointer(evt);
-      return { x: pointer.x, y: pointer.y };
-    };
-
-    const handleMouseDown = async (opt: fabric.IEvent<MouseEvent>) => {
-      const mode = activeToolRef.current;
-      const point = getPoint(opt.e);
-      const fabricLib = await ensureFabric();
-      const session = drawingSession.current;
-
-      const beginSession = (tool: WallToolId, initialPoint: Point, temp?: fabric.Object) => {
-        drawingSession.current = { mode: tool, points: [initialPoint], temp } as DrawingSession;
-        setIsDrawing(true);
-      };
-
-      if (mode === 'polyline') {
-        if (!session || session.mode !== 'polyline') {
-          const temp = new fabricLib.Polyline([point], {
-            stroke: defaultColor,
-            strokeWidth: thicknessPx,
-            fill: 'rgba(17,17,17,0.15)',
-            selectable: false,
-            evented: false,
-            strokeLineJoin: 'round',
-          });
-          canvas.add(temp);
-          beginSession('polyline', point, temp);
-        } else {
-          session.points.push(point);
-          (session.temp as fabric.Polyline)?.set({ points: [...session.points] });
-          canvas.requestRenderAll();
-        }
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        cancelDrawing();
         return;
       }
-
-      if (mode === 'rectangle') {
-        if (!session || session.mode !== 'rectangle') {
-          const initialPoints = computeWallPolygon(point, { x: point.x + 1, y: point.y + 1 });
-          const temp = new fabricLib.Polygon(initialPoints, {
-            fill: 'rgba(17,17,17,0.4)',
-            stroke: defaultColor,
-            strokeWidth: 1,
-            selectable: false,
-            evented: false,
-          });
-          canvas.add(temp);
-          beginSession('rectangle', point, temp);
-        } else {
-          const [start] = session.points;
-          const polygonPoints = computeWallPolygon(start, point);
-          const rect = new fabricLib.Polygon(polygonPoints, {
-            fill: defaultColor,
-            stroke: defaultColor,
-            strokeWidth: 1,
-          }) as FabricShape;
-          rect.data = { id: generateId(), type: 'wall', label: 'Rect wall' };
-          if (session.temp) canvas.remove(session.temp);
-          canvas.add(rect);
-          canvas.setActiveObject(rect);
-          canvas.requestRenderAll();
-          drawingSession.current = null;
-          setIsDrawing(false);
-        }
-        return;
-      }
-
-      if (mode === 'arc') {
-        if (!session || session.mode !== 'arc') {
-          beginSession('arc', point);
-        } else {
-          session.points.push(point);
-          if (session.points.length === 3) {
-            const [start, control, end] = session.points;
-            const pathString = `M ${start.x} ${start.y} Q ${control.x} ${control.y} ${end.x} ${end.y}`;
-            const arcPath = new fabricLib.Path(pathString, {
-              stroke: defaultColor,
-              strokeWidth: thicknessPx,
-              fill: 'rgba(17,17,17,0.1)',
-              strokeLineCap: 'round',
-            }) as FabricShape;
-            arcPath.data = { id: generateId(), type: 'wall', label: 'Arc wall' };
-            if (session.temp) canvas.remove(session.temp);
-            canvas.add(arcPath);
-            canvas.setActiveObject(arcPath);
-            canvas.requestRenderAll();
-            drawingSession.current = null;
-            setIsDrawing(false);
-          }
-        }
+      if ((event.key === 'Enter' || event.key === 'Return') && draft?.mode === 'polyline') {
+        finalizePolyline(draft.points);
+        setDraft(null);
       }
     };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [draft, cancelDrawing, finalizePolyline]);
 
-    const handleMouseMove = (opt: fabric.IEvent<MouseEvent>) => {
-      const session = drawingSession.current;
-      if (!session) return;
-      const pointer = canvas.getPointer(opt.e);
-
-      if (session.mode === 'polyline') {
-        const temp = session.temp as fabric.Polyline;
-        if (temp) {
-          temp.set({ points: [...session.points, { x: pointer.x, y: pointer.y }] });
-          canvas.requestRenderAll();
-        }
-      } else if (session.mode === 'rectangle') {
-        const temp = session.temp as fabric.Polygon;
-        const [start] = session.points;
-        if (temp && start) {
-          const polygonPoints = computeWallPolygon(start, { x: pointer.x, y: pointer.y });
-          temp.set({ points: polygonPoints });
-          canvas.requestRenderAll();
-        }
-      } else if (session.mode === 'arc') {
-        const fabricLib = fabricLibRef.current;
-        if (!fabricLib) return;
-        const start = session.points[0];
-        const control = session.points[1] ?? { x: pointer.x, y: pointer.y };
-        const end = { x: pointer.x, y: pointer.y };
-        const pathString = `M ${start.x} ${start.y} Q ${control.x} ${control.y} ${end.x} ${end.y}`;
-        if (session.temp) {
-          canvas.remove(session.temp);
-        }
-        const tempPath = new fabricLib.Path(pathString, {
-          stroke: defaultColor,
-          strokeWidth: thicknessPx,
-          fill: 'rgba(17,17,17,0.1)',
-          selectable: false,
-          evented: false,
-        });
-        canvas.add(tempPath);
-        session.temp = tempPath;
-        canvas.requestRenderAll();
-      }
-    };
-
-    const handleDoubleClick = async () => {
-      const session = drawingSession.current;
-      const canvasInstance = fabricRef.current;
-      if (!session || !canvasInstance || session.mode !== 'polyline' || session.points.length < 2) {
-        return;
-      }
-      const fabricLib = await ensureFabric();
-      const polyline = new fabricLib.Polyline(session.points, {
-        stroke: '#0f172a',
-        strokeWidth: 18,
-        fill: '',
-        strokeLineJoin: 'round',
-      }) as FabricShape;
-      polyline.data = { id: generateId(), type: 'wall', label: 'Polyline wall' };
-      if (session.temp) canvasInstance.remove(session.temp);
-      canvasInstance.add(polyline);
-      canvasInstance.setActiveObject(polyline);
-      canvasInstance.requestRenderAll();
-      drawingSession.current = null;
-      setIsDrawing(false);
-    };
-
-    canvas.on('mouse:down', handleMouseDown);
-    canvas.on('mouse:move', handleMouseMove);
-    canvas.on('mouse:dblclick', handleDoubleClick);
-
-    return () => {
-      canvas.off('mouse:down', handleMouseDown);
-      canvas.off('mouse:move', handleMouseMove);
-      canvas.off('mouse:dblclick', handleDoubleClick);
-    };
-  }, [canvasReady, ensureFabric, thicknessPx, computeWallPolygon]);
-
-  const addElement = async (type: Exclude<LayoutElementType, 'wall'>) => {
-    const canvas = fabricRef.current;
-    if (!canvas) return;
-    cancelDrawing();
-    const fabricLib = await ensureFabric();
-    const { width, height, opacity, label } = palette[type];
-    const id = generateId();
-    const seed = elementSeedRef.current++;
-    const offsetX = ((seed % 5) - 2) * 18;
-    const offsetY = ((Math.floor(seed / 5) % 5) - 2) * 12;
-    const rect = new fabricLib.Rect({
-      width,
-      height,
-      fill: defaultColor,
-      opacity,
-      left: canvas.getWidth() / 2 - width / 2 + offsetX,
-      top: canvas.getHeight() / 2 - height / 2 + offsetY,
-      rx: type === 'door' ? 8 : 4,
-      ry: type === 'door' ? 8 : 4,
-      stroke: defaultColor,
-      strokeWidth: 2,
-      hasRotatingPoint: true,
-      cornerColor: '#3c6ff0',
-      cornerStyle: 'circle',
-      transparentCorners: false,
-    }) as FabricShape;
-    rect.data = {
-      id,
-      type,
-      label: `${label} ${canvas.getObjects().length + 1}`,
-    };
-    canvas.add(rect);
-    canvas.setActiveObject(rect);
-    canvas.requestRenderAll();
-  };
-
-  const handleBackdrop = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !fabricRef.current) return;
-    const url = URL.createObjectURL(file);
-    if (bgUrl.current) {
-      URL.revokeObjectURL(bgUrl.current);
+  const handleMouseMove = useCallback((event: KonvaEventObject<MouseEvent>) => {
+    const stage = event.target.getStage();
+    if (!stage) return;
+    const position = stage.getPointerPosition();
+    if (!position) {
+      setPointer(null);
+      return;
     }
-    bgUrl.current = url;
-    void ensureFabric().then((fabricLib) => {
-      fabricLib.Image.fromURL(url, (img) => {
-        img.set({
-          scaleX: fabricRef.current!.getWidth() / img.width!,
-          scaleY: fabricRef.current!.getHeight() / img.height!,
-          opacity: 0.35,
-        });
-        fabricRef.current!.setBackgroundImage(img, fabricRef.current!.renderAll.bind(fabricRef.current));
-        setBackdropName(file.name);
-      });
-    });
-  };
+    setPointer({ x: position.x, y: position.y });
+  }, []);
 
-  const clearCanvas = () => {
+  const handleMouseLeave = useCallback(() => {
+    setPointer(null);
+  }, []);
+
+  const handleStageMouseDown = useCallback(
+    (event: KonvaEventObject<MouseEvent>) => {
+      const stage = event.target.getStage();
+      if (!stage || event.target !== stage) return;
+      const pointerPosition = stage.getPointerPosition();
+      if (!pointerPosition) return;
+      const point = { x: pointerPosition.x, y: pointerPosition.y };
+
+      if (activeWallTool === 'polyline') {
+        if (!draft || draft.mode !== 'polyline') {
+          setDraft({ mode: 'polyline', points: [point] });
+        } else {
+          setDraft({ mode: 'polyline', points: [...draft.points, point] });
+        }
+        return;
+      }
+
+      if (activeWallTool === 'rectangle') {
+        if (!draft || draft.mode !== 'rectangle') {
+          setDraft({ mode: 'rectangle', start: point });
+        } else {
+          finalizeRectangle(draft.start, point);
+          setDraft(null);
+        }
+        return;
+      }
+
+      if (activeWallTool === 'arc') {
+        if (!draft || draft.mode !== 'arc') {
+          setDraft({ mode: 'arc', points: [point] });
+        } else if (draft.points.length === 1) {
+          setDraft({ mode: 'arc', points: [...draft.points, point] });
+        } else {
+          finalizeArc([...draft.points, point]);
+          setDraft(null);
+        }
+      }
+    },
+    [activeWallTool, draft, finalizeArc, finalizeRectangle],
+  );
+
+  const handleDoubleClick = useCallback(
+    (event: KonvaEventObject<MouseEvent>) => {
+      const stage = event.target.getStage();
+      if (!stage || event.target !== stage) return;
+      if (draft?.mode === 'polyline') {
+        finalizePolyline(draft.points);
+        setDraft(null);
+      }
+    },
+    [draft, finalizePolyline],
+  );
+
+  const handleBackdrop = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      cancelDrawing();
+      const url = URL.createObjectURL(file);
+      if (backdropUrlRef.current) {
+        URL.revokeObjectURL(backdropUrlRef.current);
+      }
+      backdropUrlRef.current = url;
+      setBackdropSrc(url);
+      setBackdropName(file.name);
+    },
+    [cancelDrawing],
+  );
+
+  const clearCanvas = useCallback(() => {
     cancelDrawing();
-    const canvas = fabricRef.current;
-    if (canvas) {
-      canvas.getObjects().forEach((obj) => canvas.remove(obj));
-      canvas.setBackgroundImage(undefined, canvas.renderAll.bind(canvas));
-      canvas.setBackgroundColor('#f8fafc', canvas.renderAll.bind(canvas));
-    }
     onElementsChange([]);
     setBackdropName(null);
-  };
+    if (backdropUrlRef.current) {
+      URL.revokeObjectURL(backdropUrlRef.current);
+      backdropUrlRef.current = null;
+    }
+    setBackdropSrc(null);
+  }, [cancelDrawing, onElementsChange]);
 
   const formValues = useMemo(
     () => ({
@@ -1138,6 +966,211 @@ function LayoutStage({
     setActiveWallTool(tool);
   };
 
+  const addOpeningElement = useCallback(
+    (type: Exclude<LayoutElementType, 'wall'>) => {
+      cancelDrawing();
+      const { label, fill, width, height } = palette[type];
+      const count = elements.filter((element) => element.type === type).length + 1;
+      const jitterX = (Math.random() - 0.5) * 40;
+      const jitterY = (Math.random() - 0.5) * 40;
+      const x = stageSize.width / 2 - width / 2 + jitterX;
+      const y = stageSize.height / 2 - height / 2 + jitterY;
+      const geometry: OpeningGeometry = { kind: 'opening', width, height, x, y };
+      const next: LayoutElement = {
+        id: generateId(),
+        type,
+        label: `${label} ${count}`,
+        width,
+        height,
+        left: x,
+        top: y,
+        angle: 0,
+        fill,
+        geometry,
+      };
+      onElementsChange([...elements, next]);
+    },
+    [cancelDrawing, elements, onElementsChange, stageSize.height, stageSize.width],
+  );
+
+  const handleOpeningDrag = useCallback(
+    (elementId: string, x: number, y: number) => {
+      onElementsChange(
+        elements.map((element) =>
+          element.id === elementId && element.geometry?.kind === 'opening'
+            ? {
+                ...element,
+                left: x,
+                top: y,
+                geometry: { ...element.geometry, x, y },
+              }
+            : element,
+        ),
+      );
+    },
+    [elements, onElementsChange],
+  );
+
+  const describeElement = useCallback(
+    (element: LayoutElement) => {
+      if (!element.geometry) {
+        return `${Math.round(element.width)}x${Math.round(element.height)} px`;
+      }
+      if (element.geometry.kind === 'opening') {
+        return `${Math.round(element.geometry.width)}x${Math.round(
+          element.geometry.height,
+        )} px | drag to reposition`;
+      }
+      if (element.geometry.kind === 'polyline') {
+        const segments = Math.max(1, element.geometry.points.length / 2 - 1);
+        return `${segments} segment${segments > 1 ? 's' : ''} | ${
+          element.thicknessMm ?? wallThicknessMm
+        } mm`;
+      }
+      if (element.geometry.kind === 'rectangle') {
+        return `${Math.round(element.width)}x${Math.round(element.height)} px | ${
+          element.thicknessMm ?? wallThicknessMm
+        } mm`;
+      }
+      if (element.geometry.kind === 'arc') {
+        return `Arc | ${element.thicknessMm ?? wallThicknessMm} mm`;
+      }
+      return `${Math.round(element.width)}x${Math.round(element.height)} px`;
+    },
+    [wallThicknessMm],
+  );
+
+  const wallShapes = elements.map((element) => {
+    const geometry = element.geometry;
+    if (!geometry || geometry.kind === 'opening') return null;
+    const color = element.fill ?? defaultColor;
+    const strokeWidth = mmToPx(element.thicknessMm ?? wallThicknessMm);
+    if (geometry.kind === 'polyline') {
+      return (
+        <Line
+          key={element.id}
+          points={geometry.points}
+          stroke={color}
+          strokeWidth={strokeWidth}
+          lineCap="round"
+          lineJoin="round"
+          listening={false}
+        />
+      );
+    }
+    if (geometry.kind === 'rectangle') {
+      return (
+        <Line
+          key={element.id}
+          points={geometry.points}
+          closed
+          stroke={color}
+          strokeWidth={1}
+          fill={color}
+          opacity={0.85}
+          listening={false}
+        />
+      );
+    }
+    return (
+      <Line
+        key={element.id}
+        points={geometry.points}
+        bezier
+        stroke={color}
+        strokeWidth={strokeWidth}
+        lineCap="round"
+        lineJoin="round"
+        listening={false}
+      />
+    );
+  });
+
+  const openingShapes = elements.map((element) => {
+    if (element.geometry?.kind !== 'opening') return null;
+    const stroke = element.type === 'door' ? '#f97316' : '#3c6ff0';
+    return (
+      <Rect
+        key={element.id}
+        x={element.geometry.x}
+        y={element.geometry.y}
+        width={element.geometry.width}
+        height={element.geometry.height}
+        fill={element.fill}
+        opacity={element.type === 'door' ? 0.9 : 0.75}
+        stroke={stroke}
+        strokeWidth={2}
+        cornerRadius={element.type === 'door' ? 8 : 4}
+        draggable
+        onDragEnd={(event) => handleOpeningDrag(element.id, event.target.x(), event.target.y())}
+      />
+    );
+  });
+
+  const draftShape = (() => {
+    if (!draft) return null;
+    if (draft.mode === 'polyline') {
+      const staticPoints = flattenPoints(draft.points);
+      const previewPoints = pointer ? [...staticPoints, pointer.x, pointer.y] : staticPoints;
+      return (
+        <Line
+          points={previewPoints}
+          stroke={defaultColor}
+          strokeWidth={thicknessPx}
+          lineCap="round"
+          lineJoin="round"
+          dash={[8, 4]}
+          listening={false}
+        />
+      );
+    }
+    if (draft.mode === 'rectangle' && pointer) {
+      const corners = [
+        { x: draft.start.x, y: draft.start.y },
+        { x: pointer.x, y: draft.start.y },
+        { x: pointer.x, y: pointer.y },
+        { x: draft.start.x, y: pointer.y },
+      ];
+      return (
+        <Line
+          points={flattenPoints(corners)}
+          closed
+          stroke={defaultColor}
+          strokeWidth={2}
+          fill="rgba(15,23,42,0.08)"
+          dash={[6, 4]}
+          listening={false}
+        />
+      );
+    }
+    if (draft.mode === 'arc') {
+      const [start, control] = draft.points;
+      if (!start) return null;
+      const previewControl = control ?? pointer ?? start;
+      const previewEnd = pointer ?? control ?? start;
+      return (
+        <Line
+          points={[
+            start.x,
+            start.y,
+            previewControl.x,
+            previewControl.y,
+            previewEnd.x,
+            previewEnd.y,
+          ]}
+          bezier
+          stroke={defaultColor}
+          strokeWidth={thicknessPx}
+          dash={[8, 4]}
+          lineCap="round"
+          lineJoin="round"
+          listening={false}
+        />
+      );
+    }
+    return null;
+  })();
+
   return (
     <section className="flex flex-col gap-6 rounded-3xl bg-transparent">
       <div className="rounded-3xl bg-white p-6 shadow-sm">
@@ -1149,7 +1182,7 @@ function LayoutStage({
           <div className="flex gap-2">
             <input
               type="file"
-              accept="image/*,application/pdf"
+              accept="image/*"
               onChange={handleBackdrop}
               className="hidden"
               id="layout-upload"
@@ -1161,6 +1194,7 @@ function LayoutStage({
               Upload plan
             </label>
             <button
+              type="button"
               onClick={clearCanvas}
               className="rounded-full border border-transparent bg-slate-100 px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-200"
             >
@@ -1175,13 +1209,14 @@ function LayoutStage({
             <div className="mt-2 flex flex-wrap gap-3">
               {wallTools.map(({ id, label, icon: Icon }) => (
                 <button
+                  type="button"
                   key={id}
                   onClick={() => selectWallTool(id)}
                   className={clsx(
                     'flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition',
                     activeWallTool === id
-                      ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]'
-                      : 'border-slate-200 text-slate-600 hover:border-slate-300',
+                      ? 'border-[var(--accent)] bg-white text-[var(--accent)] shadow-sm'
+                      : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300',
                   )}
                 >
                   <Icon active={activeWallTool === id} />
@@ -1189,14 +1224,18 @@ function LayoutStage({
                 </button>
               ))}
             </div>
-            <p className="mt-4 text-xs font-semibold uppercase text-slate-500">Doors & windows</p>
-            <div className="mt-2 flex flex-wrap gap-3">
+            <p className="mt-4 text-xs text-slate-500">
+              Polyline: click to add points, double-click or press Enter to finish. Rectangle: two
+              clicks. Arc: three clicks (start, control, end). ESC or switching tools cancels the
+              current shape.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center gap-3">
               {(['door', 'window'] as const).map((type) => (
                 <button
+                  type="button"
                   key={type}
                   onClick={() => {
-                    cancelDrawing();
-                    void addElement(type);
+                    addOpeningElement(type);
                   }}
                   className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300"
                 >
@@ -1211,11 +1250,12 @@ function LayoutStage({
             <div className="mt-2 space-y-1 text-sm text-slate-500">
               <p>
                 Active tool:{' '}
-                <span className="font-semibold text-slate-700">{activeWallTool}</span>
+                <span className="font-semibold text-slate-700">
+                  {wallTools.find((tool) => tool.id === activeWallTool)?.label ?? activeWallTool}
+                </span>
               </p>
               <p className="text-xs text-slate-400">
-                Polyline: click to add points, double-click to finish. Rectangle: two clicks. Arc:
-                three clicks (start, control, end). ESC or switching tools cancels the current shape.
+                Click on empty canvas areas to sketch. Elements are stored immediately.
               </p>
               {backdropName && (
                 <p>
@@ -1252,9 +1292,7 @@ function LayoutStage({
                     }
                     className="w-28 rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
                   />
-                  <span className="text-xs text-slate-400">
-                    ≈ {Math.round(thicknessPx)} px
-                  </span>
+                  <span className="text-xs text-slate-400">~ {Math.round(thicknessPx)} px</span>
                 </div>
               </div>
             </div>
@@ -1265,7 +1303,41 @@ function LayoutStage({
           ref={wrapperRef}
           className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
         >
-          <canvas ref={canvasRef} className="block w-full rounded-2xl bg-white min-h-[420px]" />
+          <Stage
+            width={stageSize.width}
+            height={stageSize.height}
+            className="block w-full rounded-2xl bg-white"
+            style={{ cursor: isDrawing ? 'crosshair' : 'cell' }}
+            onMouseDown={handleStageMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+            onDblClick={handleDoubleClick}
+          >
+            <Layer>
+              <Rect
+                x={0}
+                y={0}
+                width={stageSize.width}
+                height={stageSize.height}
+                fill="#ffffff"
+                listening={false}
+              />
+              {backgroundImage && (
+                <KonvaImage
+                  image={backgroundImage}
+                  x={0}
+                  y={0}
+                  width={stageSize.width}
+                  height={stageSize.height}
+                  opacity={0.35}
+                  listening={false}
+                />
+              )}
+              {wallShapes}
+              {openingShapes}
+              {draftShape}
+            </Layer>
+          </Stage>
         </div>
       </div>
 
@@ -1330,10 +1402,8 @@ function LayoutStage({
                 key={element.id}
                 className="flex items-center justify-between rounded-2xl border border-slate-100 px-3 py-2 text-sm"
               >
-                <span className="font-medium text-slate-700">{element.label}</span>
-                <span className="text-xs text-slate-400">
-                  {Math.round(element.width)}x{Math.round(element.height)} px
-                </span>
+                <span className="font-semibold text-slate-700">{element.label}</span>
+                <span className="text-xs text-slate-400">{describeElement(element)}</span>
               </div>
             ))}
           </div>
@@ -1342,6 +1412,7 @@ function LayoutStage({
     </section>
   );
 }
+
 type RenderStageProps = {
   layoutName: string;
   furniture: FurnitureSample[];
@@ -1605,3 +1676,4 @@ function RenderStage({
     </section>
   );
 }
+
