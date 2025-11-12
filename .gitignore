@@ -1,0 +1,20 @@
+# Node / frontend artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.swc/
+frontend/.env.local
+frontend/.env*
+
+# Python backend artifacts
+backend/.venv/
+backend/__pycache__/
+backend/.mypy_cache/
+backend/.pytest_cache/
+backend/.env
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+*.log
