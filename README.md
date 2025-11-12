@@ -3,7 +3,7 @@
 InteriorDesignApp is a three-stage workflow for transforming a 2D room layout into photorealistic renders powered by Nano Banana and iterative material refinements. Users sketch or upload precise floor plans, convert them into perspective renders enriched with furniture references and prompts, and then selectively restyle materials for any object in the scene.
 
 ## Features
-- Flat-design, light-themed layout studio powered by Fabric.js for walls/doors/windows plus image overlays and metadata capture.
+- Flat-design, light-themed layout studio powered by a Konva-based CAD canvas featuring ortho snapping, draw/select modes, undo history, and wall-aware placement for walls/doors/windows plus image overlays and metadata capture.
 - Render stage with React Query mutations, furniture reference uploads, prompt presets, and Nano Banana job tracking.
 - Material editing workstation where objects inherit from the layout graph, accept per-object prompts, and log edit history with previews.
 - Local settings drawer for Nano Banana and asset storage API keys, persisted via Zustand.
@@ -23,6 +23,6 @@ InteriorDesignApp is a three-stage workflow for transforming a 2D room layout in
 4. Configure `.env` files (frontend and backend) with Nano Banana credentials, storage keys, database URLs, Redis, etc., before integrating with real services.
 
 ## Controls
-- **Layout Stage**: use drawing tools for walls/doors/windows, or upload SVG/DXF plans; snap/measure controls ensure accuracy.
+- **Layout Stage**: use drawing tools for walls/doors/windows with ortho snapping, undo/delete, and draw/select modes; doors/windows automatically snap to nearby walls (even arcs), or upload SVG/DXF plans for tracing.
 - **Render Stage**: select layout, attach furniture samples, tweak text prompts, and submit render jobs; monitor progress indicators.
 - **Material Stage**: click rendered objects to reveal masks, choose new material keywords/swatches, and launch targeted edits with undo history.

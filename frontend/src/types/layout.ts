@@ -11,6 +11,8 @@ export type OpeningGeometry = {
   height: number;
   x: number;
   y: number;
+  angle?: number;
+  wallId?: string;
 };
 
 export type LayoutGeometry = WallGeometry | OpeningGeometry;

@@ -26,6 +26,7 @@ import type {
   OpeningGeometry,
 } from '@/types/layout';
 import type { KonvaEventObject } from 'konva/lib/Node';
+import type { Rect as KonvaRect } from 'konva/lib/shapes/Rect';
 
 const layoutMetaSchema = z.object({
   layoutName: z.string().min(2, 'Name is required'),
@@ -119,6 +120,8 @@ const initialPrompt =
 const initialStylePreset = 'natural-soft';
 const defaultColor = '#111111';
 const defaultWallThicknessMm = 200;
+const UNDO_HISTORY_LIMIT = 50;
+const OPENING_SNAP_DISTANCE = 40;
 type Point = { x: number; y: number };
 
 const flattenPoints = (points: Point[]) =>
@@ -143,6 +146,86 @@ const boundsFromPoints = (points: Point[]) => {
 };
 
 const mmToPx = (mm: number) => Math.max(4, mm / 10);
+
+const sampleQuadraticPoints = (start: Point, control: Point, end: Point, segments = 24) => {
+  const safeSegments = Math.max(2, segments);
+  const result: Point[] = [];
+  for (let i = 0; i <= safeSegments; i += 1) {
+    const t = i / safeSegments;
+    const oneMinusT = 1 - t;
+    const x =
+      oneMinusT * oneMinusT * start.x +
+      2 * oneMinusT * t * control.x +
+      t * t * end.x;
+    const y =
+      oneMinusT * oneMinusT * start.y +
+      2 * oneMinusT * t * control.y +
+      t * t * end.y;
+    result.push({ x, y });
+  }
+  return result;
+};
+
+const toPointPairs = (values: number[]): Point[] => {
+  const result: Point[] = [];
+  for (let i = 0; i < values.length; i += 2) {
+    result.push({ x: values[i], y: values[i + 1] });
+  }
+  return result;
+};
+
+const getWallPathPoints = (element: LayoutElement): Point[] => {
+  const geometry = element.geometry;
+  if (!geometry) return [];
+  if (geometry.kind === 'polyline') {
+    return toPointPairs(geometry.points);
+  }
+  if (geometry.kind === 'arc') {
+    const [sx, sy, cx, cy, ex, ey] = geometry.points;
+    return sampleQuadraticPoints({ x: sx, y: sy }, { x: cx, y: cy }, { x: ex, y: ey }, 48);
+  }
+  if (geometry.kind === 'rectangle') {
+    return toPointPairs(geometry.points);
+  }
+  return [];
+};
+
+const closestPointOnSegment = (point: Point, start: Point, end: Point) => {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy || 1;
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+  const closest = { x: start.x + t * dx, y: start.y + t * dy };
+  const distance = Math.hypot(point.x - closest.x, point.y - closest.y);
+  const angle = Math.atan2(dy, dx);
+  return { closest, distance, angle };
+};
+
+type SnapResult = { point: Point; angle: number; wallId: string };
+
+const findSnapPointOnWalls = (point: Point, walls: LayoutElement[]): SnapResult | null => {
+  let best: SnapResult | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  walls.forEach((wall) => {
+    const path = getWallPathPoints(wall);
+    for (let i = 0; i < path.length - 1; i += 1) {
+      const { closest, distance, angle } = closestPointOnSegment(point, path[i], path[i + 1]);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = { point: closest, angle: (angle * 180) / Math.PI, wallId: wall.id };
+      }
+    }
+  });
+  if (!best || bestDistance > OPENING_SNAP_DISTANCE) {
+    return null;
+  }
+  return best;
+};
+
+const getOpeningCenter = (element: LayoutElement) => ({
+  x: element.left + element.width / 2,
+  y: element.top + element.height / 2,
+});
 
 function PolylineIcon({ active }: { active?: boolean }) {
   return (
@@ -735,6 +818,12 @@ function LayoutStage({
   const [backdropName, setBackdropName] = useState<string | null>(null);
   const [backdropSrc, setBackdropSrc] = useState<string | null>(null);
   const [pointer, setPointer] = useState<Point | null>(null);
+  const [interactionMode, setInteractionMode] = useState<'draw' | 'select'>('draw');
+  const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
+  const [orthoMode, setOrthoMode] = useState(true);
+  const historyRef = useRef<LayoutElement[][]>([]);
+  const [historySize, setHistorySize] = useState(0);
+  const canUndo = historySize > 0;
   const [backgroundImage] = useImage(backdropSrc ?? '');
   const thicknessPx = useMemo(() => mmToPx(wallThicknessMm), [wallThicknessMm]);
   const isDrawing = Boolean(draft);
@@ -760,6 +849,129 @@ function LayoutStage({
     return () => observer.disconnect();
   }, []);
 
+  const applyOrthoPoint = useCallback(
+    (point: Point, anchor?: Point) => {
+      if (!orthoMode || !anchor) {
+        return point;
+      }
+      const dx = point.x - anchor.x;
+      const dy = point.y - anchor.y;
+      if (Math.abs(dx) >= Math.abs(dy)) {
+        return { x: point.x, y: anchor.y };
+      }
+      return { x: anchor.x, y: point.y };
+    },
+    [orthoMode],
+  );
+
+  const applyElementsChange = useCallback(
+    (
+      producer: (current: LayoutElement[]) => LayoutElement[] | null,
+      options?: { preserveSelectionId?: string | null },
+    ): boolean => {
+      const next = producer(elements);
+      if (!next || next === elements) {
+        return false;
+      }
+      historyRef.current.push(elements);
+      if (historyRef.current.length > UNDO_HISTORY_LIMIT) {
+        historyRef.current.shift();
+      }
+      setHistorySize(historyRef.current.length);
+      onElementsChange(next);
+      if (options?.preserveSelectionId) {
+        const id = options.preserveSelectionId;
+        setSelectedElementId(next.some((element) => element.id === id) ? id : null);
+      } else {
+        setSelectedElementId(null);
+      }
+      return true;
+    },
+    [elements, onElementsChange],
+  );
+
+  const undoLast = useCallback(() => {
+    const previous = historyRef.current.pop();
+    if (!previous) return;
+    setHistorySize(historyRef.current.length);
+    setSelectedElementId(null);
+    onElementsChange(previous);
+  }, [onElementsChange]);
+
+  const deleteSelected = useCallback(() => {
+    if (!selectedElementId) return;
+    applyElementsChange((current) => {
+      if (!current.some((element) => element.id === selectedElementId)) {
+        return null;
+      }
+      return current.filter((element) => element.id !== selectedElementId);
+    });
+  }, [applyElementsChange, selectedElementId]);
+
+  const commitOpeningSnap = useCallback(
+    (elementId: string, snap: SnapResult) => {
+      const target = elements.find(
+        (element) => element.id === elementId && element.geometry?.kind === 'opening',
+      );
+      if (!target) return false;
+      const { point, angle, wallId } = snap;
+      const left = point.x - target.width / 2;
+      const top = point.y - target.height / 2;
+      return applyElementsChange(
+        (current) => {
+          const idx = current.findIndex((element) => element.id === elementId);
+          if (idx === -1) return null;
+          const updated = [...current];
+          updated[idx] = {
+            ...current[idx],
+            left,
+            top,
+            angle,
+            geometry: {
+              kind: 'opening',
+              width: target.width,
+              height: target.height,
+              x: left,
+              y: top,
+              angle,
+              wallId,
+            } satisfies OpeningGeometry,
+          };
+          return updated;
+        },
+        { preserveSelectionId: elementId },
+      );
+    },
+    [applyElementsChange, elements],
+  );
+
+  const stageCursor = interactionMode === 'select' ? 'pointer' : isDrawing ? 'crosshair' : 'cell';
+  const selectedElement = useMemo(
+    () => elements.find((element) => element.id === selectedElementId) ?? null,
+    [elements, selectedElementId],
+  );
+  const wallElements = useMemo(
+    () => elements.filter((element) => element.type === 'wall' && element.geometry),
+    [elements],
+  );
+  const elementLabels = useMemo(() => {
+    const map = new Map<string, string>();
+    elements.forEach((element) => {
+      map.set(element.id, element.label);
+    });
+    return map;
+  }, [elements]);
+  const canDelete = Boolean(selectedElementId);
+
+  const handleShapeSelect = useCallback(
+    (elementId: string, event?: KonvaEventObject<MouseEvent>) => {
+      if (interactionMode !== 'select') return;
+      event?.cancelBubble?.();
+      setSelectedElementId(elementId);
+    },
+    [interactionMode],
+  );
+
   useEffect(
     () => () => {
       if (backdropUrlRef.current) {
@@ -769,35 +981,42 @@ function LayoutStage({
     [],
   );
 
-  const commitWallElement = useCallback(
-    (geometry: WallGeometry, rawPoints: Point[]) => {
-      if (rawPoints.length === 0) return;
-      const bounds = boundsFromPoints(rawPoints);
-      const wallIndex = elements.filter((element) => element.type === 'wall').length + 1;
-      const next: LayoutElement = {
-        id: generateId(),
-        type: 'wall',
-        label: `Wall ${wallIndex}`,
-        width: bounds.width,
-        height: bounds.height,
-        left: bounds.left,
-        top: bounds.top,
-        angle: 0,
-        fill: defaultColor,
-        geometry,
-        thicknessMm: wallThicknessMm,
-      };
-      onElementsChange([...elements, next]);
+  const commitWallElements = useCallback(
+    (entries: { geometry: WallGeometry; rawPoints: Point[] }[]) => {
+      const validEntries = entries.filter((entry) => entry.rawPoints.length >= 2);
+      if (validEntries.length === 0) return;
+      applyElementsChange((current) => {
+        const existingWalls = current.filter((element) => element.type === 'wall').length;
+        const additions = validEntries.map(({ geometry, rawPoints }, idx) => {
+          const bounds = boundsFromPoints(rawPoints);
+          return {
+            id: generateId(),
+            type: 'wall' as const,
+            label: `Wall ${existingWalls + idx + 1}`,
+            width: bounds.width,
+            height: bounds.height,
+            left: bounds.left,
+            top: bounds.top,
+            angle: 0,
+            fill: defaultColor,
+            geometry,
+            thicknessMm: wallThicknessMm,
+          };
+        });
+        return [...current, ...additions];
+      });
     },
-    [elements, onElementsChange, wallThicknessMm],
+    [applyElementsChange, wallThicknessMm],
   );
 
   const finalizePolyline = useCallback(
     (points: Point[]) => {
       if (points.length < 2) return;
-      commitWallElement({ kind: 'polyline', points: flattenPoints(points) }, points);
+      commitWallElements([
+        { geometry: { kind: 'polyline', points: flattenPoints(points) }, rawPoints: points },
+      ]);
     },
-    [commitWallElement],
+    [commitWallElements],
   );
 
   const finalizeRectangle = useCallback(
@@ -811,21 +1030,35 @@ function LayoutStage({
         { x: end.x, y: end.y },
         { x: start.x, y: end.y },
       ];
-      commitWallElement({ kind: 'rectangle', points: flattenPoints(corners) }, corners);
+      const segments: [Point, Point][] = [
+        [corners[0], corners[1]],
+        [corners[1], corners[2]],
+        [corners[2], corners[3]],
+        [corners[3], corners[0]],
+      ];
+      commitWallElements(
+        segments.map(([a, b]) => ({
+          geometry: { kind: 'polyline', points: flattenPoints([a, b]) },
+          rawPoints: [a, b],
+        })),
+      );
     },
-    [commitWallElement],
+    [commitWallElements],
   );
 
   const finalizeArc = useCallback(
     (points: Point[]) => {
       if (points.length !== 3) return;
       const [start, control, end] = points;
-      commitWallElement(
-        { kind: 'arc', points: [start.x, start.y, control.x, control.y, end.x, end.y] },
-        points,
-      );
+      const sampled = sampleQuadraticPoints(start, control, end);
+      commitWallElements([
+        {
+          geometry: { kind: 'arc', points: [start.x, start.y, control.x, control.y, end.x, end.y] },
+          rawPoints: sampled,
+        },
+      ]);
     },
-    [commitWallElement],
+    [commitWallElements],
   );
 
   useEffect(() => {
@@ -838,10 +1071,18 @@ function LayoutStage({
         finalizePolyline(draft.points);
         setDraft(null);
       }
+      if (event.key === 'Delete' && selectedElementId) {
+        event.preventDefault();
+        deleteSelected();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        undoLast();
+      }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [draft, cancelDrawing, finalizePolyline]);
+  }, [draft, cancelDrawing, finalizePolyline, deleteSelected, selectedElementId, undoLast]);
 
   const handleMouseMove = useCallback((event: KonvaEventObject<MouseEvent>) => {
     const stage = event.target.getStage();
@@ -861,16 +1102,26 @@ function LayoutStage({
   const handleStageMouseDown = useCallback(
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
-      if (!stage || event.target !== stage) return;
+      if (!stage) return;
+      if (interactionMode === 'select') {
+        if (event.target === stage) {
+          setSelectedElementId(null);
+        }
+        return;
+      }
+      if (event.target !== stage) return;
       const pointerPosition = stage.getPointerPosition();
       if (!pointerPosition) return;
       const point = { x: pointerPosition.x, y: pointerPosition.y };
 
       if (activeWallTool === 'polyline') {
+        const anchor =
+          draft && draft.mode === 'polyline' ? draft.points[draft.points.length - 1] : undefined;
+        const snappedPoint = anchor ? applyOrthoPoint(point, anchor) : point;
         if (!draft || draft.mode !== 'polyline') {
-          setDraft({ mode: 'polyline', points: [point] });
+          setDraft({ mode: 'polyline', points: [snappedPoint] });
         } else {
-          setDraft({ mode: 'polyline', points: [...draft.points, point] });
+          setDraft({ mode: 'polyline', points: [...draft.points, snappedPoint] });
         }
         return;
       }
@@ -896,19 +1147,19 @@ function LayoutStage({
         }
       }
     },
-    [activeWallTool, draft, finalizeArc, finalizeRectangle],
+    [activeWallTool, applyOrthoPoint, draft, finalizeArc, finalizeRectangle, interactionMode],
   );
 
   const handleDoubleClick = useCallback(
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
-      if (!stage || event.target !== stage) return;
+      if (!stage || event.target !== stage || interactionMode !== 'draw') return;
       if (draft?.mode === 'polyline') {
         finalizePolyline(draft.points);
         setDraft(null);
       }
     },
-    [draft, finalizePolyline],
+    [draft, finalizePolyline, interactionMode],
   );
 
   const handleBackdrop = useCallback(
@@ -929,14 +1180,14 @@ function LayoutStage({
 
   const clearCanvas = useCallback(() => {
     cancelDrawing();
-    onElementsChange([]);
+    applyElementsChange((current) => (current.length === 0 ? null : []));
     setBackdropName(null);
     if (backdropUrlRef.current) {
       URL.revokeObjectURL(backdropUrlRef.current);
       backdropUrlRef.current = null;
     }
     setBackdropSrc(null);
-  }, [cancelDrawing, onElementsChange]);
+  }, [applyElementsChange, cancelDrawing]);
 
   const formValues = useMemo(
     () => ({
@@ -961,54 +1212,80 @@ function LayoutStage({
   };
 
   const selectWallTool = (tool: WallToolId) => {
-    if (tool === activeWallTool) return;
+    if (tool === activeWallTool && interactionMode === 'draw') return;
     cancelDrawing();
+    setInteractionMode('draw');
     setActiveWallTool(tool);
   };
 
   const addOpeningElement = useCallback(
     (type: Exclude<LayoutElementType, 'wall'>) => {
       cancelDrawing();
+      const walls = wallElements;
+      if (walls.length === 0) {
+        console.warn('Draw walls before placing doors or windows.');
+        return;
+      }
+      const desiredCenter = { x: stageSize.width / 2, y: stageSize.height / 2 };
+      const snap = findSnapPointOnWalls(desiredCenter, walls);
+      if (!snap) {
+        console.warn('No nearby wall found for placing the opening.');
+        return;
+      }
+      const { point, angle, wallId } = snap;
       const { label, fill, width, height } = palette[type];
-      const count = elements.filter((element) => element.type === type).length + 1;
-      const jitterX = (Math.random() - 0.5) * 40;
-      const jitterY = (Math.random() - 0.5) * 40;
-      const x = stageSize.width / 2 - width / 2 + jitterX;
-      const y = stageSize.height / 2 - height / 2 + jitterY;
-      const geometry: OpeningGeometry = { kind: 'opening', width, height, x, y };
-      const next: LayoutElement = {
-        id: generateId(),
-        type,
-        label: `${label} ${count}`,
-        width,
-        height,
-        left: x,
-        top: y,
-        angle: 0,
-        fill,
-        geometry,
-      };
-      onElementsChange([...elements, next]);
+      const left = point.x - width / 2;
+      const top = point.y - height / 2;
+      applyElementsChange((current) => {
+        const count = current.filter((element) => element.type === type).length + 1;
+        const next: LayoutElement = {
+          id: generateId(),
+          type,
+          label: `${label} ${count}`,
+          width,
+          height,
+          left,
+          top,
+          angle,
+          fill,
+          geometry: {
+            kind: 'opening',
+            width,
+            height,
+            x: left,
+            y: top,
+            angle,
+            wallId,
+          },
+        };
+        return [...current, next];
+      });
     },
-    [cancelDrawing, elements, onElementsChange, stageSize.height, stageSize.width],
+    [applyElementsChange, cancelDrawing, stageSize.height, stageSize.width, wallElements],
   );
 
   const handleOpeningDrag = useCallback(
-    (elementId: string, x: number, y: number) => {
-      onElementsChange(
-        elements.map((element) =>
-          element.id === elementId && element.geometry?.kind === 'opening'
-            ? {
-                ...element,
-                left: x,
-                top: y,
-                geometry: { ...element.geometry, x, y },
-              }
-            : element,
-        ),
-      );
+    (element: LayoutElement, position: Point, revert: () => void, node?: Konva.Rect) => {
+      if (element.geometry?.kind !== 'opening') {
+        revert();
+        return;
+      }
+      const snap = findSnapPointOnWalls(position, wallElements);
+      if (!snap) {
+        revert();
+        return;
+      }
+      const updated = commitOpeningSnap(element.id, snap);
+      if (!updated) {
+        revert();
+        return;
+      }
+      if (node) {
+        node.position(snap.point);
+        node.rotation(snap.angle);
+      }
     },
-    [elements, onElementsChange],
+    [commitOpeningSnap, wallElements],
   );
 
   const describeElement = useCallback(
@@ -1017,9 +1294,11 @@ function LayoutStage({
         return `${Math.round(element.width)}x${Math.round(element.height)} px`;
       }
       if (element.geometry.kind === 'opening') {
+        const host =
+          (element.geometry.wallId && elementLabels.get(element.geometry.wallId)) || 'wall';
         return `${Math.round(element.geometry.width)}x${Math.round(
           element.geometry.height,
-        )} px | drag to reposition`;
+        )} px | ${host}`;
       }
       if (element.geometry.kind === 'polyline') {
         const segments = Math.max(1, element.geometry.points.length / 2 - 1);
@@ -1037,24 +1316,32 @@ function LayoutStage({
       }
       return `${Math.round(element.width)}x${Math.round(element.height)} px`;
     },
-    [wallThicknessMm],
+    [elementLabels, wallThicknessMm],
   );
 
   const wallShapes = elements.map((element) => {
     const geometry = element.geometry;
     if (!geometry || geometry.kind === 'opening') return null;
     const color = element.fill ?? defaultColor;
+    const isSelected = element.id === selectedElementId;
     const strokeWidth = mmToPx(element.thicknessMm ?? wallThicknessMm);
+    const effectiveStroke = isSelected ? strokeWidth + 2 : strokeWidth;
+    const strokeColor = isSelected ? '#4f46e5' : color;
+    const listening = interactionMode === 'select';
+    const selectionHandler = listening
+      ? (evt: KonvaEventObject<MouseEvent>) => handleShapeSelect(element.id, evt)
+      : undefined;
     if (geometry.kind === 'polyline') {
       return (
         <Line
           key={element.id}
           points={geometry.points}
-          stroke={color}
-          strokeWidth={strokeWidth}
+          stroke={strokeColor}
+          strokeWidth={effectiveStroke}
           lineCap="round"
           lineJoin="round"
-          listening={false}
+          listening={listening}
+          onMouseDown={selectionHandler}
         />
       );
     }
@@ -1064,45 +1351,80 @@ function LayoutStage({
           key={element.id}
           points={geometry.points}
           closed
-          stroke={color}
-          strokeWidth={1}
-          fill={color}
-          opacity={0.85}
-          listening={false}
+          stroke={strokeColor}
+          strokeWidth={isSelected ? 2 : 1}
+          fill={isSelected ? 'rgba(79,70,229,0.15)' : color}
+          opacity={isSelected ? 0.9 : 0.85}
+          listening={listening}
+          onMouseDown={selectionHandler}
         />
       );
     }
-    return (
-      <Line
-        key={element.id}
-        points={geometry.points}
-        bezier
-        stroke={color}
-        strokeWidth={strokeWidth}
-        lineCap="round"
-        lineJoin="round"
-        listening={false}
-      />
-    );
+    if (geometry.kind === 'arc') {
+      const [sx, sy, cx, cy, ex, ey] = geometry.points;
+      const curvePoints = sampleQuadraticPoints(
+        { x: sx, y: sy },
+        { x: cx, y: cy },
+        { x: ex, y: ey },
+      );
+      return (
+        <Line
+          key={element.id}
+          points={flattenPoints(curvePoints)}
+          stroke={strokeColor}
+          strokeWidth={effectiveStroke}
+          lineCap="round"
+          lineJoin="round"
+          listening={listening}
+          onMouseDown={selectionHandler}
+        />
+      );
+    }
+    return null;
   });
 
   const openingShapes = elements.map((element) => {
     if (element.geometry?.kind !== 'opening') return null;
-    const stroke = element.type === 'door' ? '#f97316' : '#3c6ff0';
+    const baseStroke = element.type === 'door' ? '#f97316' : '#3c6ff0';
+    const isSelected = element.id === selectedElementId;
+    const stroke = isSelected ? '#4f46e5' : baseStroke;
+    const strokeWidth = isSelected ? 3 : 2;
+    const listening = interactionMode === 'select';
+    const rotation = element.geometry.angle ?? element.angle ?? 0;
+    const center = getOpeningCenter(element);
     return (
       <Rect
         key={element.id}
-        x={element.geometry.x}
-        y={element.geometry.y}
+        x={center.x}
+        y={center.y}
+        offsetX={element.width / 2}
+        offsetY={element.height / 2}
         width={element.geometry.width}
         height={element.geometry.height}
+        rotation={rotation}
         fill={element.fill}
-        opacity={element.type === 'door' ? 0.9 : 0.75}
+        opacity={element.type === 'door' ? (isSelected ? 1 : 0.9) : isSelected ? 0.9 : 0.75}
         stroke={stroke}
-        strokeWidth={2}
+        strokeWidth={strokeWidth}
         cornerRadius={element.type === 'door' ? 8 : 4}
-        draggable
-        onDragEnd={(event) => handleOpeningDrag(element.id, event.target.x(), event.target.y())}
+        draggable={listening}
+        listening={listening}
+        onMouseDown={listening ? (evt) => handleShapeSelect(element.id, evt) : undefined}
+        onDragStart={(evt) => {
+          if (!listening) {
+            evt.target.stopDrag();
+            return;
+          }
+          setSelectedElementId(element.id);
+        }}
+        onDragEnd={(event) => {
+          const node = event.target as KonvaRect;
+          const revert = () => {
+            node.position(center);
+            node.rotation(rotation);
+          };
+          handleOpeningDrag(element, { x: node.x(), y: node.y() }, revert, node);
+        }}
       />
     );
   });
@@ -1111,7 +1433,11 @@ function LayoutStage({
     if (!draft) return null;
     if (draft.mode === 'polyline') {
       const staticPoints = flattenPoints(draft.points);
-      const previewPoints = pointer ? [...staticPoints, pointer.x, pointer.y] : staticPoints;
+      const anchor = draft.points[draft.points.length - 1];
+      const previewTarget = pointer && anchor ? applyOrthoPoint(pointer, anchor) : pointer;
+      const previewPoints = previewTarget
+        ? [...staticPoints, previewTarget.x, previewTarget.y]
+        : staticPoints;
       return (
         <Line
           points={previewPoints}
@@ -1131,14 +1457,15 @@ function LayoutStage({
         { x: pointer.x, y: pointer.y },
         { x: draft.start.x, y: pointer.y },
       ];
+      const looped = [...corners, corners[0]];
       return (
         <Line
-          points={flattenPoints(corners)}
-          closed
+          points={flattenPoints(looped)}
           stroke={defaultColor}
-          strokeWidth={2}
-          fill="rgba(15,23,42,0.08)"
-          dash={[6, 4]}
+          strokeWidth={thicknessPx}
+          lineCap="round"
+          lineJoin="round"
+          dash={[6, 6]}
           listening={false}
         />
       );
@@ -1148,17 +1475,10 @@ function LayoutStage({
       if (!start) return null;
       const previewControl = control ?? pointer ?? start;
       const previewEnd = pointer ?? control ?? start;
+      const previewPoints = sampleQuadraticPoints(start, previewControl, previewEnd);
       return (
         <Line
-          points={[
-            start.x,
-            start.y,
-            previewControl.x,
-            previewControl.y,
-            previewEnd.x,
-            previewEnd.y,
-          ]}
-          bezier
+          points={flattenPoints(previewPoints)}
           stroke={defaultColor}
           strokeWidth={thicknessPx}
           dash={[8, 4]}
@@ -1204,58 +1524,140 @@ function LayoutStage({
         </div>
 
         <div className="mt-5 grid gap-4 lg:grid-cols-[2fr_1fr]">
-          <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
-            <p className="text-xs font-semibold uppercase text-slate-500">Wall tools</p>
-            <div className="mt-2 flex flex-wrap gap-3">
-              {wallTools.map(({ id, label, icon: Icon }) => (
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
+              <p className="text-xs font-semibold uppercase text-slate-500">Wall tools</p>
+              <div className="mt-2 flex flex-wrap gap-3">
+                {wallTools.map(({ id, label, icon: Icon }) => (
+                  <button
+                    type="button"
+                    key={id}
+                    onClick={() => selectWallTool(id)}
+                    className={clsx(
+                      'flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition',
+                      activeWallTool === id
+                        ? 'border-[var(--accent)] bg-white text-[var(--accent)] shadow-sm'
+                        : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300',
+                    )}
+                  >
+                    <Icon active={activeWallTool === id} />
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-4 text-xs text-slate-500">
+                Polyline: click to add points, double-click or press Enter to finish. Rectangle: two
+                clicks. Arc: three clicks (start, control, end). ESC or switching tools cancels the
+                current shape. Ortho snap keeps segments horizontal/vertical by default.
+              </p>
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                {(['door', 'window'] as const).map((type) => (
+                  <button
+                    type="button"
+                    key={type}
+                    onClick={() => {
+                      setInteractionMode('draw');
+                      addOpeningElement(type);
+                    }}
+                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300"
+                  >
+                    {type === 'door' ? <DoorIcon /> : <WindowIcon />}
+                    Add {type}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-2xl border border-slate-100 bg-white p-4">
+              <p className="text-xs font-semibold uppercase text-slate-500">Commands</p>
+              <div className="mt-2 flex flex-wrap gap-2">
                 <button
                   type="button"
-                  key={id}
-                  onClick={() => selectWallTool(id)}
+                  onClick={() => setInteractionMode('draw')}
                   className={clsx(
-                    'flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition',
-                    activeWallTool === id
+                    'rounded-xl border px-3 py-2 text-sm font-medium transition',
+                    interactionMode === 'draw'
                       ? 'border-[var(--accent)] bg-white text-[var(--accent)] shadow-sm'
                       : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300',
                   )}
                 >
-                  <Icon active={activeWallTool === id} />
-                  {label}
+                  Draw mode
                 </button>
-              ))}
-            </div>
-            <p className="mt-4 text-xs text-slate-500">
-              Polyline: click to add points, double-click or press Enter to finish. Rectangle: two
-              clicks. Arc: three clicks (start, control, end). ESC or switching tools cancels the
-              current shape.
-            </p>
-            <div className="mt-4 flex flex-wrap items-center gap-3">
-              {(['door', 'window'] as const).map((type) => (
                 <button
                   type="button"
-                  key={type}
                   onClick={() => {
-                    addOpeningElement(type);
+                    cancelDrawing();
+                    setInteractionMode('select');
                   }}
-                  className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:border-slate-300"
+                  className={clsx(
+                    'rounded-xl border px-3 py-2 text-sm font-medium transition',
+                    interactionMode === 'select'
+                      ? 'border-[var(--accent)] bg-white text-[var(--accent)] shadow-sm'
+                      : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300',
+                  )}
                 >
-                  {type === 'door' ? <DoorIcon /> : <WindowIcon />}
-                  Add {type}
+                  Select mode
                 </button>
-              ))}
+                <button
+                  type="button"
+                  onClick={undoLast}
+                  disabled={!canUndo}
+                  className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Undo
+                </button>
+                <button
+                  type="button"
+                  onClick={deleteSelected}
+                  disabled={!canDelete}
+                  className="rounded-xl border border-rose-200 px-3 py-2 text-sm font-medium text-rose-600 transition hover:border-rose-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Delete
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setOrthoMode((value) => !value)}
+                  className={clsx(
+                    'rounded-xl border px-3 py-2 text-sm font-medium transition',
+                    orthoMode
+                      ? 'border-emerald-300 bg-emerald-50 text-emerald-600'
+                      : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300',
+                  )}
+                >
+                  Ortho {orthoMode ? 'On' : 'Off'}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-slate-400">
+                Select mode lets you pick, drag, or delete existing walls, doors, and windows.
+              </p>
             </div>
           </div>
           <div className="rounded-2xl border border-slate-100 bg-white p-4">
             <p className="text-xs font-semibold uppercase text-slate-500">Canvas info</p>
             <div className="mt-2 space-y-1 text-sm text-slate-500">
               <p>
+                Mode:{' '}
+                <span className="font-semibold text-slate-700">
+                  {interactionMode === 'select' ? 'Select' : 'Draw'}
+                </span>
+              </p>
+              <p>
+                Selection:{' '}
+                <span className="font-semibold text-slate-700">
+                  {selectedElement ? selectedElement.label : 'None'}
+                </span>
+              </p>
+              <p>
                 Active tool:{' '}
                 <span className="font-semibold text-slate-700">
                   {wallTools.find((tool) => tool.id === activeWallTool)?.label ?? activeWallTool}
                 </span>
               </p>
+              <p>
+                Ortho snap:{' '}
+                <span className="font-semibold text-slate-700">{orthoMode ? 'On' : 'Off'}</span>
+              </p>
               <p className="text-xs text-slate-400">
-                Click on empty canvas areas to sketch. Elements are stored immediately.
+                Click on empty canvas areas to sketch. Toggle Select mode to edit existing geometry.
               </p>
               {backdropName && (
                 <p>
@@ -1307,7 +1709,7 @@ function LayoutStage({
             width={stageSize.width}
             height={stageSize.height}
             className="block w-full rounded-2xl bg-white"
-            style={{ cursor: isDrawing ? 'crosshair' : 'cell' }}
+            style={{ cursor: stageCursor }}
             onMouseDown={handleStageMouseDown}
             onMouseMove={handleMouseMove}
             onMouseLeave={handleMouseLeave}
@@ -1397,15 +1799,29 @@ function LayoutStage({
             {elements.length === 0 && (
               <p className="text-sm text-slate-400">Sketch walls, doors or windows to populate.</p>
             )}
-            {elements.map((element) => (
-              <div
-                key={element.id}
-                className="flex items-center justify-between rounded-2xl border border-slate-100 px-3 py-2 text-sm"
-              >
-                <span className="font-semibold text-slate-700">{element.label}</span>
-                <span className="text-xs text-slate-400">{describeElement(element)}</span>
-              </div>
-            ))}
+            {elements.map((element) => {
+              const isSelected = element.id === selectedElementId;
+              return (
+                <button
+                  type="button"
+                  key={element.id}
+                  onClick={() => {
+                    cancelDrawing();
+                    setInteractionMode('select');
+                    setSelectedElementId(element.id);
+                  }}
+                  className={clsx(
+                    'flex w-full items-center justify-between rounded-2xl border px-3 py-2 text-left text-sm transition',
+                    isSelected
+                      ? 'border-[var(--accent)] bg-indigo-50/70 text-[var(--accent)]'
+                      : 'border-slate-100 text-slate-600 hover:border-slate-200',
+                  )}
+                >
+                  <span className="font-semibold">{element.label}</span>
+                  <span className="text-xs">{describeElement(element)}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
       </div>
