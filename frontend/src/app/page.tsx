@@ -26,6 +26,8 @@ import type {
 } from '@/types/layout';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import type { Line as KonvaLine } from 'konva/lib/shapes/Line';
+import type { Stage as KonvaStage } from 'konva/lib/Stage';
+import type { Vector2d } from 'konva/lib/types';
 
 const layoutMetaSchema = z.object({
   layoutName: z.string().min(2, 'Name is required'),
@@ -122,10 +124,68 @@ const defaultWallThicknessMm = 200;
 const UNDO_HISTORY_LIMIT = 50;
 const OPENING_SNAP_DISTANCE = 40;
 const WALL_SNAP_THRESHOLD = 16;
+const CANVAS_MIN_SCALE = 0.3;
+const CANVAS_MAX_SCALE = 4;
+const CANVAS_SCALE_STEP = 1.08;
 type Point = { x: number; y: number };
 
 const flattenPoints = (points: Point[]) =>
   points.flatMap((pt) => [Number(pt.x.toFixed(2)), Number(pt.y.toFixed(2))]);
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+const extendOpenPath = (
+  points: Point[],
+  extension: number,
+  options: { extendStart?: boolean; extendEnd?: boolean } = {},
+) => {
+  if (extension <= 0 || points.length < 2) {
+    return points;
+  }
+  const isClosed = distanceBetween(points[0], points[points.length - 1]) < 0.5;
+  if (isClosed) {
+    return points;
+  }
+  const { extendStart = true, extendEnd = true } = options;
+  if (!extendStart && !extendEnd) {
+    return points;
+  }
+  const cloned = points.map((pt) => ({ ...pt }));
+  if (extendStart) {
+    const dir = normalizeVector(cloned[1].x - cloned[0].x, cloned[1].y - cloned[0].y);
+    cloned[0] = {
+      x: cloned[0].x - dir.x * extension,
+      y: cloned[0].y - dir.y * extension,
+    };
+  }
+  if (extendEnd) {
+    const lastIdx = cloned.length - 1;
+    const dir = normalizeVector(
+      cloned[lastIdx].x - cloned[lastIdx - 1].x,
+      cloned[lastIdx].y - cloned[lastIdx - 1].y,
+    );
+    cloned[lastIdx] = {
+      x: cloned[lastIdx].x + dir.x * extension,
+      y: cloned[lastIdx].y + dir.y * extension,
+    };
+  }
+  return cloned;
+};
+
+const getWorldPointerPosition = (stage: KonvaStage | null): Point | null => {
+  if (!stage) return null;
+  const pointer = stage.getPointerPosition() as Vector2d | null;
+  if (!pointer) return null;
+  const transform = stage.getAbsoluteTransform().copy();
+  transform.invert();
+  const pos = transform.point(pointer);
+  return { x: pos.x, y: pos.y };
+};
+
+const normalizeVector = (dx: number, dy: number) => {
+  const length = Math.hypot(dx, dy) || 1;
+  return { x: dx / length, y: dy / length };
+};
 
 const boundsFromPoints = (points: Point[]) => {
   if (points.length === 0) {
@@ -991,6 +1051,7 @@ function LayoutStage({
   const [marqueeRect, setMarqueeRect] = useState<{ start: Point; current: Point } | null>(null);
   const [isPanning, setIsPanning] = useState(false);
   const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
+  const [canvasScale, setCanvasScale] = useState(1);
   const panOriginRef = useRef<{ pointer: Point; offset: Point } | null>(null);
   const historyRef = useRef<LayoutElement[][]>([]);
   const [historySize, setHistorySize] = useState(0);
@@ -1394,37 +1455,33 @@ function LayoutStage({
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
       if (!stage) return;
-      const position = stage.getPointerPosition();
-      if (!position) {
+      const worldPoint = getWorldPointerPosition(stage);
+      const screenPointer = stage.getPointerPosition();
+      if (!worldPoint || !screenPointer) {
         setPointer(null);
-        if (pendingOpening) {
-          setPendingSnap(null);
-        }
-        if (marqueeRect) {
-          setMarqueeRect(null);
-        }
+        setPendingSnap(null);
+        setMarqueeRect(null);
         if (isPanning) {
           setIsPanning(false);
           panOriginRef.current = null;
         }
         return;
       }
-      const point = { x: position.x, y: position.y };
       if (isPanning && panOriginRef.current) {
         const { pointer, offset } = panOriginRef.current;
         setCanvasPan({
-          x: offset.x + point.x - pointer.x,
-          y: offset.y + point.y - pointer.y,
+          x: offset.x + screenPointer.x - pointer.x,
+          y: offset.y + screenPointer.y - pointer.y,
         });
         return;
       }
-      setPointer(point);
+      setPointer(worldPoint);
       if (marqueeRect) {
-        setMarqueeRect((prev) => (prev ? { ...prev, current: point } : prev));
+        setMarqueeRect((prev) => (prev ? { ...prev, current: worldPoint } : prev));
         return;
       }
       if (pendingOpening) {
-        setPendingSnap(findSnapPointOnWalls(point, wallElements));
+        setPendingSnap(findSnapPointOnWalls(worldPoint, wallElements));
       }
     },
     [isPanning, marqueeRect, pendingOpening, wallElements],
@@ -1442,8 +1499,8 @@ function LayoutStage({
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
       if (!stage) return;
-      if (event.e && event.e.button === 1) {
-        event.e.preventDefault();
+      if (event.evt && event.evt.button === 1) {
+        event.evt.preventDefault();
         const pointerPosition = stage.getPointerPosition();
         if (!pointerPosition) return;
         panOriginRef.current = { pointer: pointerPosition, offset: canvasPan };
@@ -1458,14 +1515,14 @@ function LayoutStage({
       }
       if (interactionMode === 'select') {
         if (event.target === stage) {
-          const pointerPosition = stage.getPointerPosition();
+          const pointerPosition = getWorldPointerPosition(stage);
           if (!pointerPosition) return;
           setMarqueeRect({ start: pointerPosition, current: pointerPosition });
         }
         return;
       }
       if (event.target !== stage) return;
-      const pointerPosition = stage.getPointerPosition();
+      const pointerPosition = getWorldPointerPosition(stage);
       if (!pointerPosition) return;
       const point = { x: pointerPosition.x, y: pointerPosition.y };
 
@@ -1553,6 +1610,27 @@ function LayoutStage({
       }
     },
     [elements, interactionMode, isPanning, marqueeRect],
+  );
+
+  const handleStageWheel = useCallback(
+    (event: KonvaEventObject<WheelEvent>) => {
+      event.evt.preventDefault();
+      const stage = event.target.getStage();
+      if (!stage) return;
+      const screenPointer = stage.getPointerPosition();
+      const worldPointer = getWorldPointerPosition(stage);
+      if (!screenPointer || !worldPointer) return;
+      const direction = event.evt.deltaY > 0 ? -1 : 1;
+      const scaleMultiplier = direction > 0 ? CANVAS_SCALE_STEP : 1 / CANVAS_SCALE_STEP;
+      const nextScale = clamp(canvasScale * scaleMultiplier, CANVAS_MIN_SCALE, CANVAS_MAX_SCALE);
+      if (nextScale === canvasScale) return;
+      setCanvasScale(nextScale);
+      setCanvasPan({
+        x: screenPointer.x - worldPointer.x * nextScale,
+        y: screenPointer.y - worldPointer.y * nextScale,
+      });
+    },
+    [canvasScale],
   );
 
   const handleDoubleClick = useCallback(
@@ -1804,10 +1882,21 @@ function LayoutStage({
     if (segments.length === 0) {
       return [];
     }
+    const isClosedPath =
+      pathPoints.length > 2 && distanceBetween(pathPoints[0], pathPoints[pathPoints.length - 1]) < 0.5;
     return segments.flatMap((segment, idx) => {
+      const extensionAmount = (strokeWidth + 4) / 2;
+      const touchesStart = !isClosedPath && distanceBetween(segment[0], pathPoints[0]) < 0.5;
+      const touchesEnd =
+        !isClosedPath && distanceBetween(segment[segment.length - 1], pathPoints[pathPoints.length - 1]) < 0.5;
+      const extendedSegment =
+        touchesStart || touchesEnd
+          ? extendOpenPath(segment, extensionAmount, { extendStart: touchesStart, extendEnd: touchesEnd })
+          : segment;
+      const flattenedPoints = flattenPoints(extendedSegment);
       const baseKey = `${element.id}-${idx}`;
       const commonProps = {
-        points: flattenPoints(segment),
+        points: flattenedPoints,
         listening,
         draggable: listening,
         onMouseDown: selectionHandler,
@@ -2594,6 +2683,8 @@ function LayoutStage({
           <Stage
             x={canvasPan.x}
             y={canvasPan.y}
+            scaleX={canvasScale}
+            scaleY={canvasScale}
             width={stageSize.width}
             height={stageSize.height}
             className="block w-full rounded-2xl bg-white"
@@ -2603,6 +2694,7 @@ function LayoutStage({
             onMouseLeave={handleMouseLeave}
             onDblClick={handleDoubleClick}
             onMouseUp={handleStageMouseUp}
+            onWheel={handleStageWheel}
           >
             <Layer>
               <Rect
