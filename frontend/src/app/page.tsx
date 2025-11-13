@@ -1860,27 +1860,20 @@ function LayoutStage({
 
     if (element.type === 'door') {
       const width = element.width;
-      const thickness = Math.max(6, element.height);
-      const halfThickness = thickness / 2;
+      const wallThicknessForDoor = Math.max(6, element.height);
+      const leafThickness = Math.max(3, wallThicknessForDoor / 2);
+      const halfLeaf = leafThickness / 2;
       const hinge = {
         x: center.x - dir.x * (width / 2),
         y: center.y - dir.y * (width / 2),
       };
-      const jambStart = {
-        x: center.x - perp.x * halfThickness,
-        y: center.y - perp.y * halfThickness,
-      };
-      const jambEnd = {
-        x: center.x + perp.x * halfThickness,
-        y: center.y + perp.y * halfThickness,
-      };
       const hingeInner = {
-        x: hinge.x - dir.x * halfThickness,
-        y: hinge.y - dir.y * halfThickness,
+        x: hinge.x - dir.x * halfLeaf,
+        y: hinge.y - dir.y * halfLeaf,
       };
       const hingeOuter = {
-        x: hinge.x + dir.x * halfThickness,
-        y: hinge.y + dir.y * halfThickness,
+        x: hinge.x + dir.x * halfLeaf,
+        y: hinge.y + dir.y * halfLeaf,
       };
       const swingInner = {
         x: hingeInner.x + perp.x * width,
@@ -1890,15 +1883,10 @@ function LayoutStage({
         x: hingeOuter.x + perp.x * width,
         y: hingeOuter.y + perp.y * width,
       };
-      const doorLeafPoints = flattenPoints([
-        hingeInner,
-        hingeOuter,
-        swingOuter,
-        swingInner,
-      ]);
       const dirAngleDeg = (Math.atan2(dir.y, dir.x) * 180) / Math.PI;
       const arcOuterRadius = Math.max(2, width);
       const arcInnerRadius = Math.max(0, arcOuterRadius - 1);
+      const doorLeafPoints = flattenPoints([hingeInner, hingeOuter, swingOuter, swingInner]);
       return (
         <Group
           key={element.id}
@@ -1926,17 +1914,12 @@ function LayoutStage({
           }}
         >
           <Line
-            points={[jambStart.x, jambStart.y, jambEnd.x, jambEnd.y]}
-            stroke="#000"
-            strokeWidth={2}
-            lineCap="butt"
-          />
-          <Line
             points={doorLeafPoints}
             closed
-            stroke="#000"
-            strokeWidth={1.5}
             fill="#ffffff"
+            stroke="#000"
+            strokeWidth={1}
+            lineJoin="miter"
             shadowColor={isSelected ? '#4f46e5' : undefined}
             shadowBlur={isSelected ? 6 : 0}
             shadowOpacity={isSelected ? 0.9 : 0}
