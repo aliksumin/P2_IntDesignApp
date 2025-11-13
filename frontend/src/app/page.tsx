@@ -12,7 +12,7 @@ import {
   type ChangeEvent,
 } from 'react';
 import clsx from 'clsx';
-import { Stage, Layer, Line, Rect, Image as KonvaImage, Group, Arc } from 'react-konva';
+import { Stage, Layer, Line, Rect, Image as KonvaImage, Group, Arc, Circle } from 'react-konva';
 import useImage from 'use-image';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -181,6 +181,29 @@ const getWorldPointerPosition = (stage: KonvaStage | null): Point | null => {
   transform.invert();
   const pos = transform.point(pointer);
   return { x: pos.x, y: pos.y };
+};
+
+const buildSegmentPolygon = (start: Point, end: Point, width: number) => {
+  const half = width / 2;
+  const direction = normalizeVector(end.x - start.x, end.y - start.y);
+  const perp = { x: -direction.y, y: direction.x };
+  return [
+    { x: start.x + perp.x * half, y: start.y + perp.y * half },
+    { x: end.x + perp.x * half, y: end.y + perp.y * half },
+    { x: end.x - perp.x * half, y: end.y - perp.y * half },
+    { x: start.x - perp.x * half, y: start.y - perp.y * half },
+  ];
+};
+
+type ConnectionPatchFragment = { wallId: string; points: [Point, Point]; color: string };
+type ConnectionPatchEntry = { point: Point; fragments: ConnectionPatchFragment[] };
+type OutlineEdge = { points: [Point, Point]; color: string };
+const toKeyPoint = (point: Point) => `${point.x.toFixed(3)}:${point.y.toFixed(3)}`;
+const formatConnectionKey = (point: Point) => toKeyPoint(point);
+const edgeKey = (a: Point, b: Point) => {
+  const aKey = toKeyPoint(a);
+  const bKey = toKeyPoint(b);
+  return aKey <= bKey ? `${aKey}|${bKey}` : `${bKey}|${aKey}`;
 };
 
 const adjustWallEndpointGeometry = (
@@ -1130,6 +1153,7 @@ function LayoutStage({
   const historyRef = useRef<LayoutElement[][]>([]);
   const [historySize, setHistorySize] = useState(0);
   const canUndo = historySize > 0;
+  const endpointDragSnapshotRef = useRef(false);
   const [backgroundImage] = useImage(backdropSrc ?? '');
   const thicknessPx = useMemo(() => mmToPx(wallThicknessMm), [wallThicknessMm]);
   const isDrawing = Boolean(draft);
@@ -1179,22 +1203,24 @@ function LayoutStage({
   const applyElementsChange = useCallback(
     (
       producer: (current: LayoutElement[]) => LayoutElement[] | null,
-      options?: { preserveSelectionId?: string | null },
+      options?: { preserveSelectionId?: string | null; transient?: boolean },
     ): boolean => {
       const next = producer(elements);
       if (!next || next === elements) {
         return false;
       }
-      historyRef.current.push(elements);
-      if (historyRef.current.length > UNDO_HISTORY_LIMIT) {
-        historyRef.current.shift();
+      if (!options?.transient) {
+        historyRef.current.push(elements);
+        if (historyRef.current.length > UNDO_HISTORY_LIMIT) {
+          historyRef.current.shift();
+        }
+        setHistorySize(historyRef.current.length);
       }
-      setHistorySize(historyRef.current.length);
       onElementsChange(next);
       if (options?.preserveSelectionId) {
         const id = options.preserveSelectionId;
         setSelectedElementId(next.some((element) => element.id === id) ? id : null);
-      } else {
+      } else if (!options?.transient) {
         setSelectedElementId(null);
       }
       return true;
@@ -1209,6 +1235,20 @@ function LayoutStage({
     setSelectedElementId(null);
     onElementsChange(previous);
   }, [onElementsChange]);
+
+  const captureEndpointDragSnapshot = useCallback(() => {
+    if (endpointDragSnapshotRef.current) return;
+    historyRef.current.push(elements);
+    if (historyRef.current.length > UNDO_HISTORY_LIMIT) {
+      historyRef.current.shift();
+    }
+    setHistorySize(historyRef.current.length);
+    endpointDragSnapshotRef.current = true;
+  }, [elements]);
+
+  const releaseEndpointDragSnapshot = useCallback(() => {
+    endpointDragSnapshotRef.current = false;
+  }, []);
 
   const deleteSelected = useCallback(() => {
     if (!selectedElementId) return;
@@ -1435,10 +1475,20 @@ function LayoutStage({
 
   const finalizePolyline = useCallback(
     (points: Point[]) => {
-      if (points.length < 2) return;
-      commitWallElements([
-        { geometry: { kind: 'polyline', points: flattenPoints(points) }, rawPoints: points },
-      ]);
+      const normalizedPoints = normalizePath(points);
+      if (normalizedPoints.length < 2) return;
+      const segments = [];
+      for (let i = 0; i < normalizedPoints.length - 1; i += 1) {
+        const start = normalizedPoints[i];
+        const end = normalizedPoints[i + 1];
+        if (distanceBetween(start, end) < 0.5) continue;
+        segments.push({
+          geometry: { kind: 'polyline', points: flattenPoints([start, end]) },
+          rawPoints: [start, end],
+        });
+      }
+      if (segments.length === 0) return;
+      commitWallElements(segments);
     },
     [commitWallElements],
   );
@@ -1826,6 +1876,7 @@ function LayoutStage({
     [commitOpeningSnap, wallElements],
   );
 
+
   const updateSelectedElement = useCallback(
     (updater: (current: LayoutElement) => LayoutElement | null) => {
       if (!selectedElementId) return false;
@@ -1914,6 +1965,83 @@ function LayoutStage({
     [applyElementsChange, wallSnapRefs],
   );
 
+  const applyWallEndpointUpdate = useCallback(
+    (wallId: string, endpointIndex: 0 | 1, point: Point, options?: { transient?: boolean }) => {
+      return applyElementsChange(
+        (current) => {
+          const index = current.findIndex((element) => element.id === wallId);
+          if (index === -1) return null;
+          const wall = current[index];
+          if (!wall.geometry || wall.geometry.kind !== 'polyline') return null;
+          const pathPoints = getWallPathPoints(wall);
+          if (pathPoints.length < 2) return null;
+          const targetIndex = endpointIndex === 0 ? 0 : pathPoints.length - 1;
+          const anchorIndex = endpointIndex === 0 ? Math.min(1, pathPoints.length - 1) : Math.max(pathPoints.length - 2, 0);
+          const anchorPoint = pathPoints[anchorIndex];
+          const snappedPoint = getSnappedPoint(point, anchorPoint);
+          if (distanceBetween(snappedPoint, pathPoints[targetIndex]) < 0.5) {
+            return null;
+          }
+          const originalEndpoints: [Point, Point] = [
+            { ...pathPoints[0] },
+            { ...pathPoints[pathPoints.length - 1] },
+          ];
+          pathPoints[targetIndex] = snappedPoint;
+          const bounds = boundsFromPoints(pathPoints);
+          const updated: LayoutElement = {
+            ...wall,
+            left: bounds.left,
+            top: bounds.top,
+            width: bounds.width,
+            height: bounds.height,
+            geometry: {
+              kind: 'polyline',
+              points: flattenPoints(pathPoints),
+            },
+          };
+          let next = [...current];
+          next[index] = updated;
+          next = propagateWallConnections(next, index, originalEndpoints, [
+            pathPoints[0],
+            pathPoints[pathPoints.length - 1],
+          ]);
+          return next;
+        },
+        { preserveSelectionId: wallId, transient: options?.transient },
+      );
+    },
+    [applyElementsChange, getSnappedPoint],
+  );
+
+  const handleEndpointHandleDragStart = useCallback(() => {
+    captureEndpointDragSnapshot();
+  }, [captureEndpointDragSnapshot]);
+
+  const handleEndpointHandleDragMove = useCallback(
+    (wallId: string, endpointIndex: 0 | 1, event: KonvaEventObject<MouseEvent>) => {
+      const stage = event.target.getStage();
+      const pointer = getWorldPointerPosition(stage) ?? {
+        x: event.target.x(),
+        y: event.target.y(),
+      };
+      applyWallEndpointUpdate(wallId, endpointIndex, pointer, { transient: true });
+    },
+    [applyWallEndpointUpdate],
+  );
+
+  const handleEndpointHandleDragEnd = useCallback(
+    (wallId: string, endpointIndex: 0 | 1, event: KonvaEventObject<MouseEvent>) => {
+      const stage = event.target.getStage();
+      const pointer = getWorldPointerPosition(stage) ?? {
+        x: event.target.x(),
+        y: event.target.y(),
+      };
+      applyWallEndpointUpdate(wallId, endpointIndex, pointer, { transient: false });
+      releaseEndpointDragSnapshot();
+    },
+    [applyWallEndpointUpdate, releaseEndpointDragSnapshot],
+  );
+
   const describeElement = useCallback(
     (element: LayoutElement) => {
       if (!element.geometry) {
@@ -1947,10 +2075,32 @@ function LayoutStage({
     [elementLabels, wallThicknessMm],
   );
 
-  const wallShapes = elements.flatMap((element) => {
-    if (element.type !== 'wall' || !element.geometry || element.geometry.kind === 'opening') {
-      return [];
-    }
+const connectionPatchMap = new Map<string, ConnectionPatchEntry>();
+const outlineEdgeMap = new Map<string, OutlineEdge>();
+
+const addConnectionFragment = (point: Point, fragment: ConnectionPatchFragment) => {
+  const key = formatConnectionKey(point);
+  const existing = connectionPatchMap.get(key);
+  if (existing) {
+    existing.fragments.push(fragment);
+  } else {
+    connectionPatchMap.set(key, { point: { ...point }, fragments: [fragment] });
+  }
+};
+
+const registerOutlineEdge = (pointA: Point, pointB: Point, color: string) => {
+  const key = edgeKey(pointA, pointB);
+  if (outlineEdgeMap.has(key)) {
+    outlineEdgeMap.delete(key);
+  } else {
+    outlineEdgeMap.set(key, { points: [pointA, pointB], color });
+  }
+};
+
+const wallShapes = elements.flatMap((element) => {
+  if (element.type !== 'wall' || !element.geometry || element.geometry.kind === 'opening') {
+    return [];
+  }
     const pathPoints = getWallPathPoints(element);
     if (pathPoints.length < 2) return [];
     const fillColor = element.fill ?? '#5b5b63';
@@ -1965,21 +2115,25 @@ function LayoutStage({
     if (segments.length === 0) {
       return [];
     }
-    const isClosedPath =
-      pathPoints.length > 2 && distanceBetween(pathPoints[0], pathPoints[pathPoints.length - 1]) < 0.5;
     return segments.flatMap((segment, idx) => {
-      const extensionAmount = (strokeWidth + 4) / 2;
-      const touchesStart = !isClosedPath && distanceBetween(segment[0], pathPoints[0]) < 0.5;
-      const touchesEnd =
-        !isClosedPath && distanceBetween(segment[segment.length - 1], pathPoints[pathPoints.length - 1]) < 0.5;
-      const extendedSegment =
-        touchesStart || touchesEnd
-          ? extendOpenPath(segment, extensionAmount, { extendStart: touchesStart, extendEnd: touchesEnd })
-          : segment;
-      const flattenedPoints = flattenPoints(extendedSegment);
       const baseKey = `${element.id}-${idx}`;
-      const commonProps = {
-        points: flattenedPoints,
+      const extensionAmount = strokeWidth / 2;
+      const startConnected = wallSnapRefs.some(
+        (ref) =>
+          ref.wallId !== element.id &&
+          distanceBetween(ref.point, segment[0]) <= WALL_CONNECTION_TOLERANCE / 2,
+      );
+      const endConnected = wallSnapRefs.some(
+        (ref) =>
+          ref.wallId !== element.id &&
+          distanceBetween(ref.point, segment[segment.length - 1]) <=
+            WALL_CONNECTION_TOLERANCE / 2,
+      );
+      const extendedSegment = extendOpenPath(segment, extensionAmount, {
+        extendStart: startConnected,
+        extendEnd: endConnected,
+      });
+      const commonDragProps = {
         listening,
         draggable: listening,
         onMouseDown: selectionHandler,
@@ -1997,28 +2151,129 @@ function LayoutStage({
           node.position({ x: 0, y: 0 });
           void applyWallTranslation(element.id, dx, dy);
         },
-        lineCap: 'butt' as const,
-        lineJoin: 'miter' as const,
       };
+      if (extendedSegment.length === 2) {
+        const polygon = buildSegmentPolygon(extendedSegment[0], extendedSegment[1], strokeWidth);
+        const polygonPoints = flattenPoints([...polygon, polygon[0]]);
+        const outlineColor = isSelected ? '#4f46e5' : '#000000';
+        registerOutlineEdge(polygon[0], polygon[1], outlineColor);
+        registerOutlineEdge(polygon[2], polygon[3], outlineColor);
+        if (!endConnected) {
+          registerOutlineEdge(polygon[1], polygon[2], outlineColor);
+        } else {
+          addConnectionFragment(segment[segment.length - 1], {
+            wallId: element.id,
+            points: [polygon[1], polygon[0]],
+            color: fillColor,
+          });
+          addConnectionFragment(segment[segment.length - 1], {
+            wallId: element.id,
+            points: [polygon[2], polygon[3]],
+            color: fillColor,
+          });
+        }
+        if (!startConnected) {
+          registerOutlineEdge(polygon[3], polygon[0], outlineColor);
+        } else {
+          addConnectionFragment(segment[0], {
+            wallId: element.id,
+            points: [polygon[0], polygon[1]],
+            color: fillColor,
+          });
+          addConnectionFragment(segment[0], {
+            wallId: element.id,
+            points: [polygon[3], polygon[2]],
+            color: fillColor,
+          });
+        }
+        return [
+          <Line
+            key={`${baseKey}-fill-poly`}
+            {...commonDragProps}
+            points={polygonPoints}
+            closed
+            fill={fillColor}
+            strokeEnabled={false}
+            shadowColor={isSelected ? '#4f46e5' : undefined}
+            shadowBlur={isSelected ? 8 : 0}
+            shadowOpacity={isSelected ? 0.9 : 0}
+          />,
+        ];
+      }
+      const fallbackPoints = flattenPoints(extendedSegment);
       return [
         <Line
-          key={`${baseKey}-outline`}
-          {...commonProps}
-          stroke="#000000"
-          strokeWidth={strokeWidth + 4}
-          shadowColor={isSelected ? '#4f46e5' : undefined}
-          shadowBlur={isSelected ? 6 : 0}
-          shadowOpacity={isSelected ? 0.9 : 0}
-        />,
-        <Line
           key={`${baseKey}-fill`}
-          {...commonProps}
+          {...commonDragProps}
+          points={fallbackPoints}
           stroke={fillColor}
           strokeWidth={strokeWidth}
+          lineCap="square"
+          lineJoin="miter"
         />,
       ];
     });
   });
+
+const connectionPatches = Array.from(connectionPatchMap.entries())
+  .map(([key, entry]) => {
+    if (entry.fragments.length < 2) return null;
+    const sorted = entry.fragments
+      .map((fragment) => {
+        const mid = {
+          x: (fragment.points[0].x + fragment.points[1].x) / 2,
+          y: (fragment.points[0].y + fragment.points[1].y) / 2,
+        };
+        const angle = Math.atan2(mid.y - entry.point.y, mid.x - entry.point.x);
+        return { ...fragment, angle };
+      })
+      .sort((a, b) => a.angle - b.angle);
+    const vertices: Point[] = [];
+    for (let i = 0; i < sorted.length; i += 1) {
+      const current = sorted[i];
+      const next = sorted[(i + 1) % sorted.length];
+      if (current.wallId === next.wallId) continue;
+      const intersection = lineIntersection(
+        current.points[0],
+        current.points[1],
+        next.points[0],
+        next.points[1],
+      );
+      if (intersection) {
+        vertices.push(intersection);
+      }
+    }
+    if (vertices.length < 3) return null;
+    const polygonPoints = flattenPoints([...vertices, vertices[0]]);
+    const color = entry.fragments[0]?.color ?? defaultColor;
+    for (let i = 0; i < vertices.length; i += 1) {
+      const a = vertices[i];
+      const b = vertices[(i + 1) % vertices.length];
+      registerOutlineEdge(a, b, '#000000');
+    }
+    return (
+      <Line
+        key={`connection-${key}`}
+        points={polygonPoints}
+        closed
+        fill={color}
+        strokeEnabled={false}
+        listening={false}
+      />
+    );
+  })
+  .filter(Boolean);
+
+const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
+  <Line
+    key={`outline-${idx}`}
+    points={flattenPoints(edge.points)}
+    stroke="#000000"
+    strokeWidth={2}
+    lineCap="butt"
+    listening={false}
+  />
+));
 
   const openingShapes = elements.map((element) => {
     if (element.geometry?.kind !== 'opening') return null;
@@ -2196,6 +2451,39 @@ function LayoutStage({
         listening={false}
       />
     ) : null;
+  const endpointHandles =
+    interactionMode === 'select' &&
+    selectedElement?.type === 'wall' &&
+    selectedElement.geometry?.kind === 'polyline'
+      ? (() => {
+          const path = getWallPathPoints(selectedElement);
+          if (path.length < 2) return null;
+          const endpoints: { point: Point; endpointIndex: 0 | 1 }[] = [
+            { point: path[0], endpointIndex: 0 },
+            { point: path[path.length - 1], endpointIndex: 1 },
+          ];
+          return endpoints.map(({ point, endpointIndex }) => (
+            <Circle
+              key={`handle-${selectedElement.id}-${endpointIndex}`}
+              x={point.x}
+              y={point.y}
+              radius={8}
+              fill="#ffffff"
+              stroke="#0f172a"
+              strokeWidth={2}
+              draggable
+              onDragStart={handleEndpointHandleDragStart}
+              onDragMove={(event) =>
+                handleEndpointHandleDragMove(selectedElement.id, endpointIndex, event)
+              }
+              onDragEnd={(event) => {
+                handleEndpointHandleDragEnd(selectedElement.id, endpointIndex, event);
+              }}
+            />
+          ));
+        })()
+      : null;
+
   const marqueeOverlay =
     marqueeRect && interactionMode === 'select'
       ? (() => {
@@ -2800,7 +3088,10 @@ function LayoutStage({
                 />
               )}
               {wallShapes}
+              {connectionPatches}
+              {outlineShapes}
               {openingShapes}
+              {endpointHandles}
               {ghostOpeningShape}
               {marqueeOverlay}
               {draftShape}
@@ -3160,3 +3451,11 @@ function RenderStage({
   );
 }
 
+const lineIntersection = (a1: Point, a2: Point, b1: Point, b2: Point): Point | null => {
+  const r = { x: a2.x - a1.x, y: a2.y - a1.y };
+  const s = { x: b2.x - b1.x, y: b2.y - b1.y };
+  const denom = r.x * s.y - r.y * s.x;
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = ((b1.x - a1.x) * s.y - (b1.y - a1.y) * s.x) / denom;
+  return { x: a1.x + t * r.x, y: a1.y + t * r.y };
+};
