@@ -12,7 +12,7 @@ import {
   type ChangeEvent,
 } from 'react';
 import clsx from 'clsx';
-import { Stage, Layer, Line, Rect, Image as KonvaImage } from 'react-konva';
+import { Stage, Layer, Line, Rect, Image as KonvaImage, Group, Arc } from 'react-konva';
 import useImage from 'use-image';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -25,7 +25,6 @@ import type {
   WallGeometry,
 } from '@/types/layout';
 import type { KonvaEventObject } from 'konva/lib/Node';
-import type { Rect as KonvaRect } from 'konva/lib/shapes/Rect';
 import type { Line as KonvaLine } from 'konva/lib/shapes/Line';
 
 const layoutMetaSchema = z.object({
@@ -349,6 +348,32 @@ const subtractIntervalsFromPath = (points: Point[], intervals: { start: number; 
   }
   return segments;
 };
+
+const getElementBounds = (element: LayoutElement) => ({
+  x: element.left ?? 0,
+  y: element.top ?? 0,
+  width: Math.max(1, element.width ?? 0),
+  height: Math.max(1, element.height ?? 0),
+});
+
+const rectsIntersect = (
+  rectA: { x: number; y: number; width: number; height: number },
+  rectB: { x: number; y: number; width: number; height: number },
+) => {
+  return !(
+    rectA.x + rectA.width < rectB.x ||
+    rectB.x + rectB.width < rectA.x ||
+    rectA.y + rectA.height < rectB.y ||
+    rectB.y + rectB.height < rectA.y
+  );
+};
+
+const normalizeRect = (start: Point, current: Point) => ({
+  x: Math.min(start.x, current.x),
+  y: Math.min(start.y, current.y),
+  width: Math.abs(start.x - current.x),
+  height: Math.abs(start.y - current.y),
+});
 
 const getOpeningCenter = (element: LayoutElement) => ({
   x: element.left + element.width / 2,
@@ -934,6 +959,7 @@ type PendingOpening =
       width: number;
       height: number;
       label: string;
+      infoHeightMm?: number;
     }
   | null;
 
@@ -962,6 +988,10 @@ function LayoutStage({
   const [pendingSnap, setPendingSnap] = useState<SnapResult | null>(null);
   const [defaultWallColor, setDefaultWallColor] = useState(defaultColor);
   const [defaultWallMaterial, setDefaultWallMaterial] = useState('Generic wall');
+  const [marqueeRect, setMarqueeRect] = useState<{ start: Point; current: Point } | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
+  const panOriginRef = useRef<{ pointer: Point; offset: Point } | null>(null);
   const historyRef = useRef<LayoutElement[][]>([]);
   const [historySize, setHistorySize] = useState(0);
   const canUndo = historySize > 0;
@@ -1059,6 +1089,10 @@ function LayoutStage({
     (opening: PendingOpening | null, snap: SnapResult, existing?: LayoutElement) => {
           const openingWidth = opening?.width ?? existing?.width ?? 0;
           const openingHeight = opening?.height ?? existing?.height ?? 0;
+      const openingHeightMm =
+        (opening && opening.infoHeightMm) ??
+        existing?.geometry?.heightMm ??
+        pxToMm(openingHeight);
       if (!openingWidth || !openingHeight) return false;
       if (!elements.some((element) => element.id === snap.wallId)) return false;
       const elementType = opening?.type ?? existing?.type ?? 'door';
@@ -1091,6 +1125,7 @@ function LayoutStage({
               wallId: snap.wallId,
               distanceAlongPath: snap.distanceAlongPath,
               wallPathLength: snap.pathLength,
+              heightMm: openingHeightMm,
             },
           };
           return updated;
@@ -1116,7 +1151,7 @@ function LayoutStage({
             wallId: snap.wallId,
               distanceAlongPath: snap.distanceAlongPath,
               wallPathLength: snap.pathLength,
-              heightMm: opening?.height ?? existing?.geometry?.heightMm ?? pxToMm(openingHeight),
+              heightMm: openingHeightMm,
             },
           };
         return [...current, openingElement];
@@ -1125,7 +1160,9 @@ function LayoutStage({
     [applyElementsChange, elements],
   );
 
-  const stageCursor = pendingOpening
+  const stageCursor = isPanning
+    ? 'grabbing'
+    : pendingOpening
     ? pendingSnap
       ? 'crosshair'
       : 'not-allowed'
@@ -1363,26 +1400,56 @@ function LayoutStage({
         if (pendingOpening) {
           setPendingSnap(null);
         }
+        if (marqueeRect) {
+          setMarqueeRect(null);
+        }
+        if (isPanning) {
+          setIsPanning(false);
+          panOriginRef.current = null;
+        }
         return;
       }
       const point = { x: position.x, y: position.y };
+      if (isPanning && panOriginRef.current) {
+        const { pointer, offset } = panOriginRef.current;
+        setCanvasPan({
+          x: offset.x + point.x - pointer.x,
+          y: offset.y + point.y - pointer.y,
+        });
+        return;
+      }
       setPointer(point);
+      if (marqueeRect) {
+        setMarqueeRect((prev) => (prev ? { ...prev, current: point } : prev));
+        return;
+      }
       if (pendingOpening) {
         setPendingSnap(findSnapPointOnWalls(point, wallElements));
       }
     },
-    [pendingOpening, wallElements],
+    [isPanning, marqueeRect, pendingOpening, wallElements],
   );
 
   const handleMouseLeave = useCallback(() => {
     setPointer(null);
     setPendingSnap(null);
+    setMarqueeRect(null);
+    setIsPanning(false);
+    panOriginRef.current = null;
   }, []);
 
   const handleStageMouseDown = useCallback(
     (event: KonvaEventObject<MouseEvent>) => {
       const stage = event.target.getStage();
       if (!stage) return;
+      if (event.e && event.e.button === 1) {
+        event.e.preventDefault();
+        const pointerPosition = stage.getPointerPosition();
+        if (!pointerPosition) return;
+        panOriginRef.current = { pointer: pointerPosition, offset: canvasPan };
+        setIsPanning(true);
+        return;
+      }
       if (pendingOpening) {
         if (pendingSnap) {
           void finalizePendingOpening();
@@ -1391,7 +1458,9 @@ function LayoutStage({
       }
       if (interactionMode === 'select') {
         if (event.target === stage) {
-          setSelectedElementId(null);
+          const pointerPosition = stage.getPointerPosition();
+          if (!pointerPosition) return;
+          setMarqueeRect({ start: pointerPosition, current: pointerPosition });
         }
         return;
       }
@@ -1437,15 +1506,53 @@ function LayoutStage({
     },
     [
       activeWallTool,
+      canvasPan,
       draft,
       finalizeArc,
       finalizePendingOpening,
       finalizeRectangle,
       getSnappedPoint,
       interactionMode,
+      panOriginRef,
       pendingOpening,
       pendingSnap,
     ],
+  );
+
+  const handleStageMouseUp = useCallback(
+    (event: KonvaEventObject<MouseEvent>) => {
+      if (isPanning) {
+        setIsPanning(false);
+        panOriginRef.current = null;
+        return;
+      }
+      if (interactionMode !== 'select') {
+        setMarqueeRect(null);
+        return;
+      }
+      const stage = event.target.getStage();
+      if (!stage) return;
+      if (marqueeRect) {
+        const rect = normalizeRect(marqueeRect.start, marqueeRect.current);
+        setMarqueeRect(null);
+        if (rect.width < 3 && rect.height < 3) {
+          if (event.target === stage) {
+            setSelectedElementId(null);
+          }
+          return;
+        }
+        const hits = elements.filter((element) =>
+          rectsIntersect(rect, getElementBounds(element)),
+        );
+        const chosen = hits.length ? hits[hits.length - 1] : null;
+        setSelectedElementId(chosen?.id ?? null);
+        return;
+      }
+      if (event.target === stage) {
+        setSelectedElementId(null);
+      }
+    },
+    [elements, interactionMode, isPanning, marqueeRect],
   );
 
   const handleDoubleClick = useCallback(
@@ -1539,6 +1646,7 @@ function LayoutStage({
         width,
         height,
         label,
+        infoHeightMm: pxToMm(height),
       });
       setPendingSnap(snap ?? null);
     },
@@ -1546,7 +1654,7 @@ function LayoutStage({
   );
 
   const handleOpeningDrag = useCallback(
-    (element: LayoutElement, position: Point, revert: () => void, node?: KonvaRect) => {
+    (element: LayoutElement, position: Point, revert: () => void) => {
       if (element.geometry?.kind !== 'opening') {
         revert();
         return false;
@@ -1560,10 +1668,6 @@ function LayoutStage({
       if (!updated) {
         revert();
         return false;
-      }
-      if (node) {
-        node.position({ x: snap.point.x, y: snap.point.y });
-        node.rotation(snap.angle);
       }
       return true;
     },
@@ -1688,11 +1792,9 @@ function LayoutStage({
     }
     const pathPoints = getWallPathPoints(element);
     if (pathPoints.length < 2) return [];
-    const color = element.fill ?? defaultColor;
+    const fillColor = element.fill ?? '#5b5b63';
     const isSelected = element.id === selectedElementId;
     const strokeWidth = mmToPx(element.thicknessMm ?? wallThicknessMm);
-    const effectiveStroke = isSelected ? strokeWidth + 2 : strokeWidth;
-    const strokeColor = isSelected ? '#4f46e5' : color;
     const listening = interactionMode === 'select';
     const selectionHandler = listening
       ? (evt: KonvaEventObject<MouseEvent>) => handleShapeSelect(element.id, evt)
@@ -1702,59 +1804,165 @@ function LayoutStage({
     if (segments.length === 0) {
       return [];
     }
-    return segments.map((segment, idx) => (
-      <Line
-        key={`${element.id}-${idx}`}
-        points={flattenPoints(segment)}
-        stroke={strokeColor}
-        strokeWidth={effectiveStroke}
-        lineCap="round"
-        lineJoin="round"
-        listening={listening}
-        draggable={listening}
-        onMouseDown={selectionHandler}
-        onDragStart={(evt) => {
+    return segments.flatMap((segment, idx) => {
+      const baseKey = `${element.id}-${idx}`;
+      const commonProps = {
+        points: flattenPoints(segment),
+        listening,
+        draggable: listening,
+        onMouseDown: selectionHandler,
+        onDragStart: (evt: KonvaEventObject<MouseEvent>) => {
           if (!listening) {
             evt.target.stopDrag();
             return;
           }
           setSelectedElementId(element.id);
-        }}
-        onDragEnd={(evt) => {
+        },
+        onDragEnd: (evt: KonvaEventObject<MouseEvent>) => {
           const node = evt.target as KonvaLine;
           const dx = node.x();
           const dy = node.y();
           node.position({ x: 0, y: 0 });
           void applyWallTranslation(element.id, dx, dy);
-        }}
-      />
-    ));
+        },
+        lineCap: 'butt' as const,
+        lineJoin: 'miter' as const,
+      };
+      return [
+        <Line
+          key={`${baseKey}-outline`}
+          {...commonProps}
+          stroke="#000000"
+          strokeWidth={strokeWidth + 4}
+          shadowColor={isSelected ? '#4f46e5' : undefined}
+          shadowBlur={isSelected ? 6 : 0}
+          shadowOpacity={isSelected ? 0.9 : 0}
+        />,
+        <Line
+          key={`${baseKey}-fill`}
+          {...commonProps}
+          stroke={fillColor}
+          strokeWidth={strokeWidth}
+        />,
+      ];
+    });
   });
 
   const openingShapes = elements.map((element) => {
     if (element.geometry?.kind !== 'opening') return null;
-    const baseStroke = element.type === 'door' ? '#f97316' : '#3c6ff0';
     const isSelected = element.id === selectedElementId;
-    const stroke = isSelected ? '#4f46e5' : baseStroke;
-    const strokeWidth = isSelected ? 3 : 2;
     const listening = interactionMode === 'select';
     const rotation = element.geometry.angle ?? element.angle ?? 0;
+    const rotationRad = (rotation * Math.PI) / 180;
+    const dir = { x: Math.cos(rotationRad), y: Math.sin(rotationRad) };
+    const perp = { x: -dir.y, y: dir.x };
     const center = getOpeningCenter(element);
+
+    if (element.type === 'door') {
+      const width = element.width;
+      const thickness = Math.max(6, element.height);
+      const halfThickness = thickness / 2;
+      const hinge = {
+        x: center.x - dir.x * (width / 2),
+        y: center.y - dir.y * (width / 2),
+      };
+      const jambStart = {
+        x: center.x - perp.x * halfThickness,
+        y: center.y - perp.y * halfThickness,
+      };
+      const jambEnd = {
+        x: center.x + perp.x * halfThickness,
+        y: center.y + perp.y * halfThickness,
+      };
+      const hingeInner = {
+        x: hinge.x - dir.x * halfThickness,
+        y: hinge.y - dir.y * halfThickness,
+      };
+      const hingeOuter = {
+        x: hinge.x + dir.x * halfThickness,
+        y: hinge.y + dir.y * halfThickness,
+      };
+      const swingInner = {
+        x: hingeInner.x + perp.x * width,
+        y: hingeInner.y + perp.y * width,
+      };
+      const swingOuter = {
+        x: hingeOuter.x + perp.x * width,
+        y: hingeOuter.y + perp.y * width,
+      };
+      const doorLeafPoints = flattenPoints([
+        hingeInner,
+        hingeOuter,
+        swingOuter,
+        swingInner,
+      ]);
+      const dirAngleDeg = (Math.atan2(dir.y, dir.x) * 180) / Math.PI;
+      const arcOuterRadius = Math.max(2, width);
+      const arcInnerRadius = Math.max(0, arcOuterRadius - 1);
+      return (
+        <Group
+          key={element.id}
+          draggable={listening}
+          listening={listening}
+          onMouseDown={listening ? (evt) => handleShapeSelect(element.id, evt) : undefined}
+          onDragStart={(evt) => {
+            if (!listening) {
+              evt.target.stopDrag();
+              return;
+            }
+            setSelectedElementId(element.id);
+          }}
+          onDragEnd={(event) => {
+            const node = event.target;
+            const dx = node.x();
+            const dy = node.y();
+            const revert = () => node.position({ x: 0, y: 0 });
+            const success = handleOpeningDrag(element, { x: center.x + dx, y: center.y + dy }, revert);
+            if (success) {
+              node.position({ x: 0, y: 0 });
+            } else {
+              revert();
+            }
+          }}
+        >
+          <Line
+            points={[jambStart.x, jambStart.y, jambEnd.x, jambEnd.y]}
+            stroke="#000"
+            strokeWidth={2}
+            lineCap="butt"
+          />
+          <Line
+            points={doorLeafPoints}
+            closed
+            stroke="#000"
+            strokeWidth={1.5}
+            fill="#ffffff"
+            shadowColor={isSelected ? '#4f46e5' : undefined}
+            shadowBlur={isSelected ? 6 : 0}
+            shadowOpacity={isSelected ? 0.9 : 0}
+          />
+          <Arc
+            x={hinge.x}
+            y={hinge.y}
+            angle={90}
+            rotation={dirAngleDeg}
+            innerRadius={arcInnerRadius}
+            outerRadius={arcOuterRadius}
+            stroke="#000"
+            strokeWidth={1}
+            shadowColor={isSelected ? '#4f46e5' : undefined}
+            shadowBlur={isSelected ? 6 : 0}
+            shadowOpacity={isSelected ? 0.9 : 0}
+          />
+        </Group>
+      );
+    }
+
+    const width = element.width;
+    const height = Math.max(6, element.height);
     return (
-      <Rect
+      <Group
         key={element.id}
-        x={center.x}
-        y={center.y}
-        offsetX={element.width / 2}
-        offsetY={element.height / 2}
-        width={element.geometry.width}
-        height={element.geometry.height}
-        rotation={rotation}
-        fill={element.fill}
-        opacity={element.type === 'door' ? (isSelected ? 1 : 0.9) : isSelected ? 0.9 : 0.75}
-        stroke={stroke}
-        strokeWidth={strokeWidth}
-        cornerRadius={element.type === 'door' ? 8 : 4}
         draggable={listening}
         listening={listening}
         onMouseDown={listening ? (evt) => handleShapeSelect(element.id, evt) : undefined}
@@ -1766,22 +1974,52 @@ function LayoutStage({
           setSelectedElementId(element.id);
         }}
         onDragEnd={(event) => {
-          const node = event.target as KonvaRect;
-          const revert = () => {
-            node.position({ x: center.x, y: center.y });
-            node.rotation(rotation);
-          };
-          const success = handleOpeningDrag(
-            element,
-            { x: node.x(), y: node.y() },
-            revert,
-            node,
-          );
-          if (!success) {
+          const node = event.target;
+          const dx = node.x();
+          const dy = node.y();
+          const revert = () => node.position({ x: 0, y: 0 });
+          const success = handleOpeningDrag(element, { x: center.x + dx, y: center.y + dy }, revert);
+          if (success) {
+            node.position({ x: 0, y: 0 });
+          } else {
             revert();
           }
         }}
-      />
+      >
+        <Rect
+          x={center.x}
+          y={center.y}
+          offsetX={width / 2}
+          offsetY={height / 2}
+          width={width}
+          height={height}
+          rotation={rotation}
+          fill="#dce9f5"
+          stroke="#000"
+          strokeWidth={2}
+        />
+        <Rect
+          x={center.x}
+          y={center.y}
+          offsetX={width / 2 - 3}
+          offsetY={height / 2 - 2}
+          width={Math.max(2, width - 6)}
+          height={Math.max(2, height - 4)}
+          rotation={rotation}
+          stroke="#ffffff"
+          strokeWidth={1}
+        />
+        <Line
+          points={[
+            center.x - dir.x * (width / 2),
+            center.y - dir.y * (width / 2),
+            center.x + dir.x * (width / 2),
+            center.y + dir.y * (width / 2),
+          ]}
+          stroke={isSelected ? '#4f46e5' : '#000'}
+          strokeWidth={1}
+        />
+      </Group>
     );
   });
 
@@ -1803,6 +2041,25 @@ function LayoutStage({
         listening={false}
       />
     ) : null;
+  const marqueeOverlay =
+    marqueeRect && interactionMode === 'select'
+      ? (() => {
+          const rect = normalizeRect(marqueeRect.start, marqueeRect.current);
+          return (
+            <Rect
+              x={rect.x}
+              y={rect.y}
+              width={rect.width}
+              height={rect.height}
+              stroke="#6366f1"
+              dash={[4, 4]}
+              strokeWidth={1}
+              fill="rgba(99,102,241,0.08)"
+              listening={false}
+            />
+          );
+        })()
+      : null;
 
   const showPropertiesPanel =
     interactionMode === 'draw' || Boolean(selectedElement) || Boolean(pendingOpening);
@@ -1838,10 +2095,11 @@ function LayoutStage({
 
   const handleOpeningDimensionUpdate = (dimension: 'width' | 'height', valueMm: number) => {
     if (Number.isNaN(valueMm)) return;
+    const normalizedMm = Math.max(20, valueMm);
     updateSelectedElement((current) => {
       if (current.geometry?.kind !== 'opening') return null;
       if (dimension === 'width') {
-        const pxValue = Math.max(2, valueMm / 10);
+        const pxValue = normalizedMm / 10;
         const center = getOpeningCenter(current);
         return {
           ...current,
@@ -1861,7 +2119,7 @@ function LayoutStage({
         ...current,
         geometry: {
           ...current.geometry,
-          heightMm: valueMm,
+          heightMm: normalizedMm,
         },
       };
     });
@@ -1890,11 +2148,12 @@ function LayoutStage({
                     prev
                       ? {
                           ...prev,
-                          width: Math.max(20, (Number(event.target.value) || 20) / 10),
+                          width: Math.max(20, Number(event.target.value) || 20) / 10,
                         }
                       : prev,
                   )
                 }
+                onFocus={(event) => event.target.select()}
                 className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
               />
             </label>
@@ -1903,17 +2162,18 @@ function LayoutStage({
               <input
                 type="number"
                 min={20}
-                value={pxToMm(pendingOpening.height)}
+                value={pendingOpening.infoHeightMm ?? pxToMm(pendingOpening.height)}
                 onChange={(event) =>
                   setPendingOpening((prev) =>
                     prev
                       ? {
                           ...prev,
-                          height: Math.max(20, (Number(event.target.value) || 20) / 10),
+                          infoHeightMm: Math.max(20, Number(event.target.value) || 20),
                         }
                       : prev,
                   )
                 }
+                onFocus={(event) => event.target.select()}
                 className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
               />
             </label>
@@ -1950,6 +2210,7 @@ function LayoutStage({
                   step={10}
                   value={wallThicknessValue}
                   onChange={(event) => handleWallThicknessUpdate(Number(event.target.value))}
+                  onFocus={(event) => event.target.select()}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
                 />
               </label>
@@ -1993,6 +2254,7 @@ function LayoutStage({
                   onChange={(event) =>
                     handleOpeningDimensionUpdate('width', Number(event.target.value))
                   }
+                  onFocus={(event) => event.target.select()}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
                 />
               </label>
@@ -2001,10 +2263,15 @@ function LayoutStage({
                 <input
                   type="number"
                   min={20}
-                  value={pxToMm(selectedElement.height)}
+                  value={
+                    selectedElement.geometry?.kind === 'opening'
+                      ? selectedElement.geometry.heightMm ?? pxToMm(selectedElement.height)
+                      : pxToMm(selectedElement.height)
+                  }
                   onChange={(event) =>
                     handleOpeningDimensionUpdate('height', Number(event.target.value))
                   }
+                  onFocus={(event) => event.target.select()}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
                 />
               </label>
@@ -2034,6 +2301,7 @@ function LayoutStage({
               step={10}
               value={wallThicknessMm}
               onChange={(event) => handleDefaultThicknessChange(Number(event.target.value))}
+              onFocus={(event) => event.target.select()}
               className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
             <span className="mt-1 block text-[11px] text-slate-500">
@@ -2074,7 +2342,7 @@ function LayoutStage({
   })();
 
   const propertiesPanel = showPropertiesPanel ? (
-    <div className="pointer-events-auto absolute right-4 top-4 w-72 max-w-[calc(100%-2rem)] rounded-2xl border border-white/60 bg-white/85 p-4 text-sm text-slate-700 shadow-xl backdrop-blur">
+    <div className="pointer-events-auto absolute right-4 top-4 w-72 max-w-[calc(100%-2rem)] rounded-2xl border border-white/60 bg-white/70 p-4 text-sm text-slate-700 shadow-xl backdrop-blur">
       {propertiesPanelContent}
     </div>
   ) : null;
@@ -2341,6 +2609,8 @@ function LayoutStage({
           className="relative mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
         >
           <Stage
+            x={canvasPan.x}
+            y={canvasPan.y}
             width={stageSize.width}
             height={stageSize.height}
             className="block w-full rounded-2xl bg-white"
@@ -2349,6 +2619,7 @@ function LayoutStage({
             onMouseMove={handleMouseMove}
             onMouseLeave={handleMouseLeave}
             onDblClick={handleDoubleClick}
+            onMouseUp={handleStageMouseUp}
           >
             <Layer>
               <Rect
@@ -2373,6 +2644,7 @@ function LayoutStage({
               {wallShapes}
               {openingShapes}
               {ghostOpeningShape}
+              {marqueeOverlay}
               {draftShape}
             </Layer>
           </Stage>
