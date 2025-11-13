@@ -124,6 +124,7 @@ const defaultWallThicknessMm = 200;
 const UNDO_HISTORY_LIMIT = 50;
 const OPENING_SNAP_DISTANCE = 40;
 const WALL_SNAP_THRESHOLD = 16;
+const WALL_CONNECTION_TOLERANCE = 12;
 const CANVAS_MIN_SCALE = 0.3;
 const CANVAS_MAX_SCALE = 4;
 const CANVAS_SCALE_STEP = 1.08;
@@ -180,6 +181,79 @@ const getWorldPointerPosition = (stage: KonvaStage | null): Point | null => {
   transform.invert();
   const pos = transform.point(pointer);
   return { x: pos.x, y: pos.y };
+};
+
+const adjustWallEndpointGeometry = (
+  element: LayoutElement,
+  referencePoint: Point,
+  delta: Point,
+  tolerance: number,
+): LayoutElement | null => {
+  if (!element.geometry || element.geometry.kind === 'opening') return null;
+  const path = getWallPathPoints(element);
+  if (path.length < 2) return null;
+  let changed = false;
+  if (distanceBetween(path[0], referencePoint) <= tolerance) {
+    path[0] = { x: path[0].x + delta.x, y: path[0].y + delta.y };
+    changed = true;
+  }
+  const lastIndex = path.length - 1;
+  if (distanceBetween(path[lastIndex], referencePoint) <= tolerance) {
+    path[lastIndex] = { x: path[lastIndex].x + delta.x, y: path[lastIndex].y + delta.y };
+    changed = true;
+  }
+  if (!changed) return null;
+  const bounds = boundsFromPoints(path);
+  return {
+    ...element,
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.width,
+    height: bounds.height,
+    geometry: {
+      kind: 'polyline',
+      points: flattenPoints(path),
+    },
+  };
+};
+
+const propagateWallConnections = (
+  elements: LayoutElement[],
+  movedIndex: number,
+  originalEndpoints: [Point, Point],
+  updatedEndpoints: [Point, Point],
+): LayoutElement[] => {
+  const adjustments = originalEndpoints
+    .map((origin, idx) => {
+      const target = updatedEndpoints[idx];
+      return {
+        origin,
+        delta: { x: target.x - origin.x, y: target.y - origin.y },
+      };
+    })
+    .filter(({ delta }) => Math.abs(delta.x) > 0.01 || Math.abs(delta.y) > 0.01);
+  if (adjustments.length === 0) {
+    return elements;
+  }
+  const next = [...elements];
+  for (let i = 0; i < next.length; i += 1) {
+    if (i === movedIndex) continue;
+    const element = next[i];
+    if (!element.geometry || element.geometry.kind === 'opening') continue;
+    let updated = element;
+    let changed = false;
+    adjustments.forEach(({ origin, delta }) => {
+      const candidate = adjustWallEndpointGeometry(updated, origin, delta, WALL_CONNECTION_TOLERANCE);
+      if (candidate) {
+        updated = candidate;
+        changed = true;
+      }
+    });
+    if (changed) {
+      next[i] = updated;
+    }
+  }
+  return next;
 };
 
 const normalizeVector = (dx: number, dy: number) => {
@@ -1782,6 +1856,10 @@ function LayoutStage({
           if (!wall.geometry || wall.geometry.kind === 'opening') return null;
           const pathPoints = getWallPathPoints(wall);
           if (pathPoints.length < 2) return null;
+          const originalEndpoints: [Point, Point] = [
+            { ...pathPoints[0] },
+            { ...pathPoints[pathPoints.length - 1] },
+          ];
           let translated = pathPoints.map((point) => ({
             x: point.x + dx,
             y: point.y + dy,
@@ -1810,6 +1888,10 @@ function LayoutStage({
             }
           }
           const bounds = boundsFromPoints(translated);
+          const updatedEndpoints: [Point, Point] = [
+            { ...translated[0] },
+            { ...translated[translated.length - 1] },
+          ];
           const updated: LayoutElement = {
             ...wall,
             left: bounds.left,
@@ -1821,8 +1903,9 @@ function LayoutStage({
               points: flattenPoints(translated),
             },
           };
-          const copy = [...current];
+          let copy = [...current];
           copy[index] = updated;
+          copy = propagateWallConnections(copy, index, originalEndpoints, updatedEndpoints);
           return copy;
         },
         { preserveSelectionId: wallId },
