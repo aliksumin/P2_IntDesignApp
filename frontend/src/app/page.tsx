@@ -10,6 +10,7 @@ import {
   type Dispatch,
   type SetStateAction,
   type ChangeEvent,
+  type RefObject,
 } from 'react';
 import clsx from 'clsx';
 import { Stage, Layer, Line, Rect, Image as KonvaImage, Group, Arc, Circle } from 'react-konva';
@@ -18,7 +19,7 @@ import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useMutation } from '@tanstack/react-query';
-import { simulateMaterialEdit, simulateRenderRequest } from '@/lib/mockApi';
+import { simulateMaterialEdit } from '@/lib/mockApi';
 import type {
   LayoutElement,
   LayoutElementType,
@@ -42,6 +43,7 @@ const renderSchema = z.object({
     .max(600),
   stylePreset: z.string(),
   cameraHeight: z.number().min(0.5).max(3),
+  aspectRatio: z.string(),
 });
 
 const materialSchema = z.object({
@@ -72,6 +74,7 @@ type RenderJob = {
   id: string;
   prompt: string;
   stylePreset: string;
+  aspectRatio?: string;
   status: 'idle' | 'queued' | 'processing' | 'complete';
   imageUrl?: string;
   createdAt: number;
@@ -513,6 +516,162 @@ const getElementBounds = (element: LayoutElement) => ({
   height: Math.max(1, element.height ?? 0),
 });
 
+const getLayoutContentBounds = (elements: LayoutElement[]) => {
+  if (elements.length === 0) {
+    return null;
+  }
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  elements.forEach((element) => {
+    const bounds = getElementBounds(element);
+    minX = Math.min(minX, bounds.x);
+    minY = Math.min(minY, bounds.y);
+    maxX = Math.max(maxX, bounds.x + bounds.width);
+    maxY = Math.max(maxY, bounds.y + bounds.height);
+  });
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    return null;
+  }
+  return {
+    left: minX,
+    top: minY,
+    right: maxX,
+    bottom: maxY,
+  };
+};
+
+const loadImageElement = (src: string) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.onload = () => resolve(image);
+    image.onerror = () =>
+      reject(new Error(`Failed to load collage image: ${src.slice(0, 60)}...`));
+    image.src = src;
+  });
+
+const composeCollageDataUrl = async (items: FurnitureSample[]) => {
+  if (typeof document === 'undefined') {
+    return null;
+  }
+  const subset = items.slice(0, 6).filter((item) => Boolean(item.previewUrl));
+  if (subset.length === 0) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 1200;
+  canvas.height = 800;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const columns = 3;
+  const rows = 2;
+  const tileWidth = canvas.width / columns;
+  const tileHeight = canvas.height / rows;
+  await Promise.all(
+    subset.map(async (item, index) => {
+      if (!item.previewUrl) return;
+      const image = await loadImageElement(item.previewUrl);
+      const col = index % columns;
+      const row = Math.floor(index / columns);
+      const cellX = col * tileWidth + 16;
+      const cellY = row * tileHeight + 16;
+      const cellWidth = tileWidth - 32;
+      const cellHeight = tileHeight - 32;
+      const ratio = Math.min(cellWidth / image.width, cellHeight / image.height);
+      const drawWidth = image.width * ratio;
+      const drawHeight = image.height * ratio;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(cellX - 6, cellY - 6, cellWidth + 12, cellHeight + 12);
+      ctx.drawImage(
+        image,
+        cellX + (cellWidth - drawWidth) / 2,
+        cellY + (cellHeight - drawHeight) / 2,
+        drawWidth,
+        drawHeight,
+      );
+    }),
+  );
+  return canvas.toDataURL('image/png');
+};
+
+const dataUrlToBase64 = (value: string) => {
+  const parts = value.split(',');
+  return parts.length > 1 ? parts[1] : value;
+};
+
+type NanoBananaPayload = {
+  jobId: string;
+  apiKey: string;
+  prompt: string;
+  stylePreset: string;
+  aspectRatio: string;
+  layoutImage: string;
+  collageImage: string;
+  cameraHeight: number;
+};
+
+const requestNanoBananaRender = async ({
+  jobId,
+  apiKey,
+  prompt,
+  stylePreset,
+  aspectRatio,
+  layoutImage,
+  collageImage,
+  cameraHeight,
+}: NanoBananaPayload) => {
+  const styleLabel = styles.find((styleOption) => styleOption.id === stylePreset)?.label ?? stylePreset;
+  const instructions = `You are Nano Banana, an interior renderer. Use the layout image (floor plan) to place walls, windows, and doors, and use the collage image to capture materials/furniture. Render a photorealistic scene with ${styleLabel} styling. Keep the virtual camera height at ${cameraHeight} meters and aspect ratio ${aspectRatio}.`;
+  const body = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: `${instructions}\n\n${prompt}` },
+          { inlineData: { mimeType: 'image/png', data: dataUrlToBase64(layoutImage) } },
+          { inlineData: { mimeType: 'image/png', data: dataUrlToBase64(collageImage) } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.4,
+      topP: 0.8,
+      topK: 32,
+      // Gemini 1.5 Flash currently expects aspect ratio hints in the prompt itself.
+      // We already embed the requested ratio in the instructions above.
+    },
+  };
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Nano Banana error (${response.status}): ${text}`);
+  }
+  type GeminiPart = {
+    inlineData?: {
+      mimeType?: string;
+      data?: string;
+    };
+  };
+  const payload = await response.json();
+  const inlinePart =
+    payload?.candidates?.[0]?.content?.parts?.find((part: GeminiPart) => part.inlineData) ?? null;
+  const inlineData = inlinePart?.inlineData;
+  if (!inlineData?.data) {
+    throw new Error('Nano Banana did not return an image payload.');
+  }
+  const imageUrl = `data:${inlineData.mimeType ?? 'image/png'};base64,${inlineData.data}`;
+  return { jobId, imageUrl };
+};
+
 const rectsIntersect = (
   rectA: { x: number; y: number; width: number; height: number },
   rectB: { x: number; y: number; width: number; height: number },
@@ -660,6 +819,10 @@ export default function HomePage() {
   const [materialEdits, setMaterialEdits] = useState<MaterialEdit[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKeys>({});
   const [wallThicknessMm, setWallThicknessMm] = useState(defaultWallThicknessMm);
+  const [layoutSnapshot, setLayoutSnapshot] = useState<string | null>(null);
+  const layoutSnapshotObjectUrlRef = useRef<string | null>(null);
+  const layoutStageRef = useRef<KonvaStage | null>(null);
+  const latestCanvasSnapshotRef = useRef<string | null>(null);
 
   const handleSaveMeta = (values: LayoutMetaForm) => {
     setLayoutMeta({
@@ -676,6 +839,82 @@ export default function HomePage() {
     setRenderJobs((prev) =>
       prev.map((job) => (job.id === jobId ? { ...job, ...patch } : job)),
     );
+
+  const setLayoutSnapshotValue = useCallback(
+    (value: string, options?: { isObjectUrl?: boolean }) => {
+      if (options?.isObjectUrl) {
+        if (layoutSnapshotObjectUrlRef.current) {
+          URL.revokeObjectURL(layoutSnapshotObjectUrlRef.current);
+        }
+        layoutSnapshotObjectUrlRef.current = value;
+      } else if (layoutSnapshotObjectUrlRef.current) {
+        URL.revokeObjectURL(layoutSnapshotObjectUrlRef.current);
+        layoutSnapshotObjectUrlRef.current = null;
+      }
+      setLayoutSnapshot(value);
+    },
+    [],
+  );
+
+  const handleLayoutSnapshotFile = useCallback(
+    (file: File) => {
+      const url = URL.createObjectURL(file);
+      setLayoutSnapshotValue(url, { isObjectUrl: true });
+    },
+    [setLayoutSnapshotValue],
+  );
+
+  const handleCanvasSnapshotUpdate = useCallback(
+    (dataUrl: string) => {
+      latestCanvasSnapshotRef.current = dataUrl;
+      if (activeStep === 1) {
+        setLayoutSnapshotValue(dataUrl);
+      }
+    },
+    [activeStep, setLayoutSnapshotValue],
+  );
+
+  const captureLayoutSnapshot = useCallback(() => {
+    const stage = layoutStageRef.current;
+    if (!stage) {
+      if (latestCanvasSnapshotRef.current) {
+        setLayoutSnapshotValue(latestCanvasSnapshotRef.current);
+      } else {
+        console.warn('Canvas capture unavailable. Open Step 1 to generate a snapshot.');
+      }
+      return;
+    }
+    const bounds = getLayoutContentBounds(elements);
+    const stageWidth = stage.width();
+    const stageHeight = stage.height();
+    const padding = 80;
+    const captureWidth = bounds
+      ? Math.max(200, bounds.right - bounds.left + padding * 2)
+      : stageWidth;
+    const captureHeight = bounds
+      ? Math.max(200, bounds.bottom - bounds.top + padding * 2)
+      : stageHeight;
+    const x = bounds ? bounds.left - padding : 0;
+    const y = bounds ? bounds.top - padding : 0;
+    const dataUrl = stage.toDataURL({
+      x,
+      y,
+      width: captureWidth,
+      height: captureHeight,
+      pixelRatio: 2,
+    });
+    setLayoutSnapshotValue(dataUrl);
+    latestCanvasSnapshotRef.current = dataUrl;
+  }, [elements, setLayoutSnapshotValue]);
+
+  useEffect(
+    () => () => {
+      if (layoutSnapshotObjectUrlRef.current) {
+        URL.revokeObjectURL(layoutSnapshotObjectUrlRef.current);
+      }
+    },
+    [],
+  );
 
   const addMaterialEdit = (edit: MaterialEdit) =>
     setMaterialEdits((prev) => [edit, ...prev].slice(0, 6));
@@ -742,6 +981,8 @@ export default function HomePage() {
             onElementsChange={setElements}
             wallThicknessMm={wallThicknessMm}
             onWallThicknessChange={setWallThicknessMm}
+            stageRef={layoutStageRef}
+            onCanvasSnapshot={handleCanvasSnapshotUpdate}
           />
         )}
         {activeStep === 2 && (
@@ -756,6 +997,10 @@ export default function HomePage() {
             renderJobs={renderJobs}
             addRenderJob={addRenderJob}
             updateRenderJob={updateRenderJob}
+            layoutSnapshot={layoutSnapshot}
+            onLayoutSnapshotUpload={handleLayoutSnapshotFile}
+            onCaptureLayoutSnapshot={captureLayoutSnapshot}
+            apiKey={apiKeys.nanoBanana}
           />
         )}
         {activeStep === 3 && (
@@ -1102,6 +1347,8 @@ type LayoutStageProps = {
   onElementsChange: (elements: LayoutElement[]) => void;
   wallThicknessMm: number;
   onWallThicknessChange: (value: number) => void;
+  stageRef?: RefObject<KonvaStage | null>;
+  onCanvasSnapshot?: (dataUrl: string) => void;
 };
 
 type DraftState =
@@ -1129,6 +1376,8 @@ function LayoutStage({
   onElementsChange,
   wallThicknessMm,
   onWallThicknessChange,
+  stageRef,
+  onCanvasSnapshot,
 }: LayoutStageProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const backdropUrlRef = useRef<string | null>(null);
@@ -1157,6 +1406,21 @@ function LayoutStage({
   const [backgroundImage] = useImage(backdropSrc ?? '');
   const thicknessPx = useMemo(() => mmToPx(wallThicknessMm), [wallThicknessMm]);
   const isDrawing = Boolean(draft);
+
+  useEffect(() => {
+    if (!stageRef?.current || !onCanvasSnapshot) return;
+    const id = requestAnimationFrame(() => {
+      const stage = stageRef.current;
+      if (!stage) return;
+      try {
+        const dataUrl = stage.toDataURL({ pixelRatio: 2 });
+        onCanvasSnapshot(dataUrl);
+      } catch (error) {
+        console.warn('Failed to capture layout snapshot', error);
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [stageRef, onCanvasSnapshot, elements, backgroundImage, wallThicknessMm, defaultWallColor]);
 
   const cancelDrawing = useCallback(() => {
     setDraft(null);
@@ -3052,6 +3316,7 @@ const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
           className="relative mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-2 shadow-inner"
         >
           <Stage
+            ref={stageRef ?? undefined}
             x={canvasPan.x}
             y={canvasPan.y}
             scaleX={canvasScale}
@@ -3198,6 +3463,10 @@ type RenderStageProps = {
   renderJobs: RenderJob[];
   addRenderJob: (job: RenderJob) => void;
   updateRenderJob: (jobId: string, patch: Partial<RenderJob>) => void;
+  layoutSnapshot: string | null;
+  onLayoutSnapshotUpload: (file: File) => void;
+  onCaptureLayoutSnapshot: () => void;
+  apiKey?: string;
 };
 
 function RenderStage({
@@ -3211,9 +3480,15 @@ function RenderStage({
   renderJobs,
   addRenderJob,
   updateRenderJob,
+  layoutSnapshot,
+  onLayoutSnapshotUpload,
+  onCaptureLayoutSnapshot,
+  apiKey,
 }: RenderStageProps) {
-
   const [uploading, setUploading] = useState(false);
+  const [aspectRatio, setAspectRatioState] = useState('16:9');
+  const [collageDataUrl, setCollageDataUrl] = useState<string | null>(null);
+  const [renderHelperMessage, setRenderHelperMessage] = useState<string | null>(null);
   const styleLookup = useMemo(() => {
     const map: Record<string, string> = {};
     styles.forEach((styleOption) => {
@@ -3221,43 +3496,127 @@ function RenderStage({
     });
     return map;
   }, []);
+  const collageImages = useMemo(() => furniture.slice(0, 6), [furniture]);
+  const heroRender = useMemo(
+    () => renderJobs.find((job) => job.status === 'complete') ?? renderJobs[0],
+    [renderJobs],
+  );
+  const suggestedPrompt = useMemo(() => {
+    const heroObjects = furniture.slice(0, 3).map((item) => item.name);
+    const objectText =
+      heroObjects.length > 0 ? ` featuring ${heroObjects.join(', ')} arranged per the plan` : '';
+    return `Create a photorealistic visualization of the ${layoutName} using the Step 1 layout${objectText}. Preserve proportions from the CAD snapshot, show natural materials, and balance daylight with warm accent lighting.`;
+  }, [layoutName, furniture]);
   const renderFormValues = useMemo(
     () => ({
       prompt,
       stylePreset,
       cameraHeight: 1.4,
+      aspectRatio,
     }),
-    [prompt, stylePreset],
+    [prompt, stylePreset, aspectRatio],
   );
 
   const {
     register,
     handleSubmit,
     formState: { errors },
+    setValue,
   } = useForm<RenderForm>({
     resolver: zodResolver(renderSchema),
     values: renderFormValues,
   });
 
-  const mutation = useMutation({
-    mutationFn: simulateRenderRequest,
+  const renderMutation = useMutation<
+    { jobId: string; imageUrl: string },
+    Error,
+    NanoBananaPayload
+  >({
+    mutationFn: requestNanoBananaRender,
     onSuccess: ({ jobId, imageUrl }) => {
+      setRenderHelperMessage(null);
       updateRenderJob(jobId, { status: 'complete', imageUrl });
+    },
+    onError: (error, variables) => {
+      const message = error instanceof Error ? error.message : 'Render failed.';
+      setRenderHelperMessage(message);
+      if (variables?.jobId) {
+        updateRenderJob(variables.jobId, { status: 'idle' });
+      }
     },
   });
 
+  useEffect(() => {
+    if (!prompt && suggestedPrompt) {
+      setPrompt(suggestedPrompt);
+      setValue('prompt', suggestedPrompt, { shouldValidate: true });
+    }
+  }, [prompt, suggestedPrompt, setPrompt, setValue]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (collageImages.length === 0) {
+      requestAnimationFrame(() => {
+        if (!cancelled) {
+          setCollageDataUrl(null);
+        }
+      });
+      return;
+    }
+    (async () => {
+      try {
+        const dataUrl = await composeCollageDataUrl(collageImages);
+        if (!cancelled) {
+          setCollageDataUrl(dataUrl);
+        }
+      } catch (error) {
+        console.warn('Failed to compose collage data', error);
+        if (!cancelled) {
+          setCollageDataUrl(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [collageImages]);
+
   const onSubmit = (values: RenderForm) => {
+    if (!apiKey) {
+      setRenderHelperMessage('Add your Nano Banana API key in API settings to request renders.');
+      return;
+    }
+    if (!layoutSnapshot) {
+      setRenderHelperMessage('Capture the layout canvas (Layout → Canvas) before rendering.');
+      return;
+    }
+    if (!collageDataUrl) {
+      setRenderHelperMessage('Upload at least one object image to build a collage.');
+      return;
+    }
+    setRenderHelperMessage(null);
     setPrompt(values.prompt);
     setStylePreset(values.stylePreset);
+    setAspectRatioState(values.aspectRatio);
     const jobId = generateId();
     addRenderJob({
       id: jobId,
       prompt: values.prompt,
       stylePreset: values.stylePreset,
+      aspectRatio: values.aspectRatio,
       status: 'processing',
       createdAt: timestamp(),
     });
-    mutation.mutate({ prompt: values.prompt, stylePreset: values.stylePreset, layoutName, jobId });
+    renderMutation.mutate({
+      jobId,
+      apiKey,
+      prompt: values.prompt,
+      stylePreset: values.stylePreset,
+      aspectRatio: values.aspectRatio,
+      layoutImage: layoutSnapshot,
+      collageImage: collageDataUrl,
+      cameraHeight: values.cameraHeight,
+    });
   };
 
   const handleFurnitureUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -3276,30 +3635,141 @@ function RenderStage({
     }, 500);
   };
 
+  const handleLayoutSnapshotInput = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    onLayoutSnapshotUpload(file);
+    event.target.value = '';
+  };
+
+  const applySuggestedPrompt = () => {
+    setPrompt(suggestedPrompt);
+    setValue('prompt', suggestedPrompt, { shouldValidate: true });
+  };
+
+  const aspectRatioOptions = ['16:9', '4:3', '1:1', '9:16'];
+
   return (
-    <section className="grid gap-6 rounded-3xl bg-transparent lg:grid-cols-2">
-      <div className="rounded-3xl bg-white p-6 shadow-sm">
-        <h3 className="text-lg font-semibold text-slate-900">Render brief</h3>
-        <form onSubmit={handleSubmit(onSubmit)} className="mt-4 space-y-4">
-          <div>
-            <label className="text-xs font-semibold uppercase text-slate-500">
-              Prompt
-            </label>
-            <textarea
-              {...register('prompt')}
-              rows={6}
-              className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm focus:border-[var(--accent)] focus:outline-none"
-              placeholder="Describe mood, materials, lighting, hero pieces..."
-            />
-            {errors.prompt && (
-              <p className="mt-1 text-xs text-rose-500">{errors.prompt.message}</p>
+    <section className="space-y-6 rounded-3xl bg-transparent">
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-slate-900">Layout</h3>
+            <div className="flex gap-2">
+              <input
+                id="layout-snapshot-upload"
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={handleLayoutSnapshotInput}
+              />
+              <label
+                htmlFor="layout-snapshot-upload"
+                className="cursor-pointer rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 hover:border-slate-300"
+              >
+                Upload
+              </label>
+              <button
+                type="button"
+                onClick={onCaptureLayoutSnapshot}
+                className="rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 hover:border-slate-300"
+              >
+                Canvas
+              </button>
+            </div>
+          </div>
+          <div className="mt-4 h-[360px] w-full overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+            {layoutSnapshot ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={layoutSnapshot}
+                alt="Layout screenshot"
+                className="h-full w-full object-contain bg-white"
+              />
+            ) : (
+              <p className="flex h-full items-center justify-center text-sm text-slate-400">
+                No screenshot yet. Export from Step 1 and drop it here.
+              </p>
             )}
           </div>
-          <div className="grid gap-4 sm:grid-cols-2">
+        </div>
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-slate-900">Object collage</h3>
             <div>
-              <label className="text-xs font-semibold uppercase text-slate-500">
-                Style preset
+              <input
+                id="furniture-upload"
+                type="file"
+                multiple
+                className="hidden"
+                accept="image/*"
+                onChange={handleFurnitureUpload}
+              />
+              <label
+                htmlFor="furniture-upload"
+                className="cursor-pointer rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 hover:border-slate-300"
+              >
+                Add images
               </label>
+            </div>
+          </div>
+          {uploading && (
+            <p className="mt-2 text-xs text-[var(--accent)]">Importing samples...</p>
+          )}
+          <div className="mt-4 h-48 rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-2">
+            {collageImages.length === 0 ? (
+              <p className="flex h-full items-center justify-center text-sm text-slate-400">
+                Drop at least one reference to generate a collage.
+              </p>
+            ) : (
+              <div className="grid h-full grid-cols-3 grid-rows-2 gap-2">
+                {collageImages.map((item) => (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={item.id}
+                    src={item.previewUrl}
+                    alt={item.name}
+                    className="h-full w-full rounded-xl object-cover"
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+          {furniture.length > 0 && (
+            <p className="mt-3 text-xs text-slate-500">
+              {furniture.length} asset{furniture.length === 1 ? '' : 's'} ready for the collage.
+            </p>
+          )}
+        </div>
+      </div>
+
+      <form onSubmit={handleSubmit(onSubmit)} className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
+          <h3 className="text-lg font-semibold text-slate-900">Text prompt</h3>
+          <textarea
+            {...register('prompt')}
+            rows={8}
+            className="mt-4 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm focus:border-[var(--accent)] focus:outline-none"
+            placeholder="Describe mood, materials, lighting, hero pieces..."
+          />
+          {errors.prompt && (
+            <p className="mt-1 text-xs text-rose-500">{errors.prompt.message}</p>
+          )}
+          <button
+            type="button"
+            onClick={applySuggestedPrompt}
+            className="mt-3 rounded-full border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
+          >
+            Use suggested prompt
+          </button>
+          <p className="mt-2 text-xs italic text-slate-400">“{suggestedPrompt}”</p>
+        </div>
+
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
+          <h3 className="text-lg font-semibold text-slate-900">Nano Banana settings</h3>
+          <div className="mt-4 space-y-4">
+            <label className="block text-xs font-semibold uppercase text-slate-500">
+              Style preset
               <select
                 {...register('stylePreset')}
                 className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
@@ -3310,11 +3780,22 @@ function RenderStage({
                   </option>
                 ))}
               </select>
-            </div>
-            <div>
-              <label className="text-xs font-semibold uppercase text-slate-500">
-                Camera height (m)
-              </label>
+            </label>
+            <label className="block text-xs font-semibold uppercase text-slate-500">
+              Aspect ratio
+              <select
+                {...register('aspectRatio')}
+                className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              >
+                {aspectRatioOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs font-semibold uppercase text-slate-500">
+              Camera height (m)
               <input
                 type="number"
                 step="0.1"
@@ -3324,85 +3805,64 @@ function RenderStage({
               {errors.cameraHeight && (
                 <p className="mt-1 text-xs text-rose-500">{errors.cameraHeight.message}</p>
               )}
-            </div>
+            </label>
           </div>
           <button
             type="submit"
-            className="w-full rounded-2xl bg-[var(--accent)] py-3 text-sm font-semibold text-white hover:bg-indigo-600 disabled:opacity-60"
-            disabled={mutation.isPending}
+            className="mt-6 w-full rounded-2xl bg-[var(--accent)] py-3 text-sm font-semibold text-white hover:bg-indigo-600 disabled:opacity-60"
+            disabled={renderMutation.isPending}
           >
-            {mutation.isPending ? 'Requesting Nano Banana render...' : 'Request render'}
+            {renderMutation.isPending ? 'Requesting Nano Banana render...' : 'Request render'}
           </button>
-        </form>
-      </div>
-
-      <div className="rounded-3xl bg-white p-6 shadow-sm">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-lg font-semibold text-slate-900">Reference assets</h3>
-            <p className="text-xs text-slate-500">
-              Drop furniture, finishes, or moodboard snippets for context.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <input
-              id="furniture-upload"
-              type="file"
-              multiple
-              className="hidden"
-              accept="image/*"
-              onChange={handleFurnitureUpload}
-            />
-            <label
-              htmlFor="furniture-upload"
-              className="cursor-pointer rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 hover:border-slate-300"
-            >
-              Upload
-            </label>
-          </div>
+          {renderHelperMessage && (
+            <p className="mt-3 text-xs text-rose-500">{renderHelperMessage}</p>
+          )}
         </div>
+      </form>
 
-        {uploading && (
-          <p className="mt-2 text-xs text-[var(--accent)]">Importing samples...</p>
-        )}
-
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          {furniture.length === 0 && (
-            <p className="rounded-2xl border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">
-              No furniture references yet.
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-slate-900">Final render</h3>
+              <p className="text-xs text-slate-500">We surface the most recent request here.</p>
+            </div>
+            {heroRender && (
+              <span
+                className={clsx(
+                  'rounded-full px-3 py-1 text-xs font-semibold',
+                  heroRender.status === 'complete'
+                    ? 'bg-emerald-50 text-emerald-600'
+                    : 'bg-amber-50 text-amber-600',
+                )}
+              >
+                {heroRender.status === 'complete' ? 'Ready' : 'Processing'}
+              </span>
+            )}
+          </div>
+          <div className="mt-4 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+            {heroRender?.imageUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={heroRender.imageUrl} alt="Latest render" className="h-72 w-full object-cover" />
+            ) : (
+              <p className="flex h-72 items-center justify-center text-sm text-slate-400">
+                No render yet. Configure settings and request one.
+              </p>
+            )}
+          </div>
+          {heroRender && (
+            <p className="mt-3 text-xs text-slate-500">
+              {styleLookup[heroRender.stylePreset] ?? 'Custom preset'} ·{' '}
+              {heroRender.aspectRatio ?? aspectRatio}
             </p>
           )}
-          {furniture.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center gap-3 rounded-2xl border border-slate-100 px-3 py-2"
-            >
-              <div className="h-12 w-12 rounded-2xl bg-slate-100">
-                {item.previewUrl && (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={item.previewUrl}
-                    alt={item.name}
-                    className="h-12 w-12 rounded-2xl object-cover"
-                  />
-                )}
-              </div>
-              <div>
-                <p className="text-sm font-semibold text-slate-700">{item.name}</p>
-                <p className="text-xs text-slate-400">
-                  {(item.size / 1024 / 1024).toFixed(1)} MB
-                </p>
-              </div>
-            </div>
-          ))}
         </div>
-
-        <div className="mt-8">
+        <div className="rounded-3xl bg-white p-6 shadow-sm">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold text-slate-900">Render queue</h3>
             <span className="text-xs text-slate-400">{renderJobs.length} requests</span>
           </div>
-          <div className="mt-3 space-y-3">
+          <div className="mt-4 space-y-3">
             {renderJobs.length === 0 && (
               <p className="rounded-2xl border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">
                 Submit a prompt to see Nano Banana renders here.
@@ -3416,7 +3876,7 @@ function RenderStage({
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <p className="text-sm font-semibold text-slate-800">
-                      {styleLookup[job.stylePreset] ?? 'Custom preset'}
+                      {styleLookup[job.stylePreset] ?? 'Custom preset'} · {job.aspectRatio ?? '16:9'}
                     </p>
                     <p className="text-xs text-slate-500">{formatDate(job.createdAt)}</p>
                     <p className="mt-1 text-xs text-slate-500">{job.prompt}</p>
@@ -3433,12 +3893,12 @@ function RenderStage({
                   </span>
                 </div>
                 {job.imageUrl && (
-                  <div className="mt-3 overflow-hidden rounded-2xl border border-slate-100">
+                  <div className="mt-3 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={job.imageUrl}
                       alt="Render preview"
-                      className="h-48 w-full object-cover"
+                      className="h-40 w-full object-cover"
                     />
                   </div>
                 )}
