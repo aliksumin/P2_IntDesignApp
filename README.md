@@ -4,7 +4,9 @@ InteriorDesignApp is a three-stage workflow for transforming a 2D room layout in
 
 ## Features
 - Flat-design, light-themed layout studio powered by a Konva-based CAD canvas featuring ortho snapping, draw/select modes, undo history, contextual properties panel (thickness, color, material, door/window dimensions), and wall-aware placement for walls/doors/windows plus image overlays and metadata capture.
+- One-click “Generate description” flow on the Layout card that sends the captured canvas to Nano Banana (Gemini 2.5 Flash Image) to produce (1) a door/window-aware textual narrative of the room and (2) an empty-room photorealistic preview that later drives rendering inputs.
 - Render stage with React Query mutations, furniture reference uploads, prompt presets, and Nano Banana job tracking.
+- Collage summary lives alongside the reference images for easy context, and render jobs automatically feed the layout narrative + preview image as the first Nano Banana input followed by the objects collage.
 - Material editing workstation where objects inherit from the layout graph, accept per-object prompts, and log edit history with previews.
 - Local settings drawer for Nano Banana and asset storage API keys, persisted via Zustand.
 - FastAPI backend scaffold exposing `/api/layouts`, `/api/renders`, `/api/materials`, and `/api/settings` endpoints backed by an in-memory store (ready for PostgreSQL/Redis swaps).

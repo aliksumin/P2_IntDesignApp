@@ -39,8 +39,14 @@ const layoutMetaSchema = z.object({
 const renderSchema = z.object({
   prompt: z
     .string()
-    .min(10, 'Prompt should describe the desired style')
-    .max(600),
+    .max(600, 'Prompt should stay under 600 characters')
+    .refine(
+      (value) => {
+        const trimmed = value.trim();
+        return trimmed.length === 0 || trimmed.length >= 10;
+      },
+      { message: 'Enter at least 10 characters if you provide a prompt.' },
+    ),
   aspectRatio: z.string(),
 });
 
@@ -93,6 +99,18 @@ type ApiKeys = {
   assetStorage?: string;
 };
 
+type LayoutInsight = {
+  shape?: string;
+  doors?: string;
+  windows?: string;
+};
+
+type LayoutInsightStatus = 'idle' | 'loading' | 'needs-key' | 'error';
+
+type LayoutNarrativeStatus = 'idle' | 'loading' | 'needs-key' | 'error';
+
+type CollageDescriptionStatus = 'idle' | 'loading' | 'needs-key' | 'error';
+
 const stepData = [
   {
     id: 1,
@@ -117,8 +135,7 @@ const initialLayoutMeta = {
   layoutNotes: 'North-facing windows, double door to balcony.',
 };
 
-const initialPrompt =
-  'Modern Scandinavian living room with warm lighting and textured walls.';
+const initialPrompt = '';
 const defaultColor = '#111111';
 const defaultWallThicknessMm = 200;
 const UNDO_HISTORY_LIMIT = 50;
@@ -617,6 +634,394 @@ const dataUrlToBase64 = (value: string) => {
   return parts.length > 1 ? parts[1] : value;
 };
 
+const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  if (typeof window !== 'undefined' && typeof window.btoa === 'function') {
+    return window.btoa(binary);
+  }
+  throw new Error('Base64 conversion is not supported in this environment.');
+};
+
+type FileDataPart = {
+  fileUri?: string;
+  mimeType?: string;
+};
+
+const downloadFileData = async (fileData: FileDataPart | undefined, apiKey: string) => {
+  if (!fileData?.fileUri) return null;
+  try {
+    const url = new URL(fileData.fileUri);
+    if (!url.searchParams.has('alt')) {
+      url.searchParams.set('alt', 'media');
+    }
+    if (!url.searchParams.has('key')) {
+      url.searchParams.set('key', apiKey);
+    }
+    const fileResponse = await fetch(url.toString());
+    if (!fileResponse.ok) {
+      console.warn('Failed to download Gemini file asset', fileResponse.status);
+      return null;
+    }
+    const buffer = await fileResponse.arrayBuffer();
+    const base64 = arrayBufferToBase64(buffer);
+    return `data:${fileData.mimeType ?? 'image/png'};base64,${base64}`;
+  } catch (error) {
+    console.warn('Unable to resolve Gemini file asset', error);
+    return null;
+  }
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const tryParseJson = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+};
+
+const extractImageDataFromNode = async (
+  node: unknown,
+  apiKey: string,
+  visited = new WeakSet<object>(),
+): Promise<string | null> => {
+  if (!node) return null;
+  if (typeof node === 'string') {
+    if (node.startsWith('data:image/')) return node;
+    const parsed = tryParseJson(node);
+    if (parsed) {
+      return extractImageDataFromNode(parsed, apiKey, visited);
+    }
+    return null;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const result = await extractImageDataFromNode(item, apiKey, visited);
+      if (result) return result;
+    }
+    return null;
+  }
+  if (!isObject(node)) {
+    return null;
+  }
+  if (visited.has(node)) return null;
+  visited.add(node);
+
+  const inlineData = node.inlineData as { data?: string; mimeType?: string } | undefined;
+  if (inlineData?.data) {
+    return `data:${inlineData.mimeType ?? 'image/png'};base64,${inlineData.data}`;
+  }
+
+  if ('fileData' in node) {
+    const dataUrl = await downloadFileData(node.fileData as FileDataPart, apiKey);
+    if (dataUrl) return dataUrl;
+  }
+
+  if ('parts' in node && Array.isArray((node as { parts?: unknown[] }).parts)) {
+    const dataUrl = await extractImageDataFromNode(
+      (node as { parts?: unknown[] }).parts,
+      apiKey,
+      visited,
+    );
+    if (dataUrl) return dataUrl;
+  }
+
+  if ('functionCall' in node) {
+    const args = (node as { functionCall?: { args?: unknown } }).functionCall?.args;
+    const dataUrl = await extractImageDataFromNode(args, apiKey, visited);
+    if (dataUrl) return dataUrl;
+  }
+
+  if ('functionResponse' in node) {
+    const result = (node as { functionResponse?: { result?: unknown } }).functionResponse?.result;
+    const dataUrl = await extractImageDataFromNode(result, apiKey, visited);
+    if (dataUrl) return dataUrl;
+  }
+
+  if ('content' in node) {
+    const contentData = await extractImageDataFromNode(
+      (node as { content?: unknown }).content,
+      apiKey,
+      visited,
+    );
+    if (contentData) return contentData;
+  }
+
+  for (const value of Object.values(node)) {
+    if (typeof value === 'string' && value.startsWith('data:image/')) {
+      return value;
+    }
+    if (typeof value === 'object' && value !== null) {
+      const result = await extractImageDataFromNode(value, apiKey, visited);
+      if (result) return result;
+    }
+  }
+
+  return null;
+};
+
+const describeCollageObjects = async (apiKey: string, collageImage: string) => {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: 'You are an interior designer. Looking at this collage of furniture and decor, invent one vivid sentence (max 25 words) describing the type of room these items belong to, including mood and one hero object.',
+              },
+              {
+                inlineData: {
+                  mimeType: 'image/png',
+                  data: dataUrlToBase64(collageImage),
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.7,
+          topP: 0.9,
+          topK: 32,
+          maxOutputTokens: 128,
+        },
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error('Unable to describe collage objects');
+  }
+  const payload = await response.json();
+  const description =
+    payload?.candidates?.[0]?.content?.parts?.find((part: { text?: string }) => part.text)?.text ??
+    '';
+  return description.replace(/\s+/g, ' ').trim();
+};
+
+const sanitizeInsightClause = (value?: string | null, fallback?: string) => {
+  if (!value) return fallback ?? '';
+  const trimmed = value.replace(/(^["'`]+|["'`]+$)/g, '').trim();
+  if (!trimmed) return fallback ?? '';
+  return trimmed.replace(/\s+/g, ' ');
+};
+
+const parseLayoutInsightText = (raw: string): LayoutInsight => {
+  if (!raw) return {};
+  const cleaned = raw.replace(/```json|```/gi, '').trim();
+  const attemptParse = (text: string) => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+  let candidate = attemptParse(cleaned);
+  if (!candidate) {
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      candidate = attemptParse(jsonMatch[0]);
+    }
+  }
+  if (candidate && typeof candidate === 'object') {
+    return {
+      shape: typeof candidate.shape === 'string' ? candidate.shape : undefined,
+      doors: typeof candidate.doors === 'string' ? candidate.doors : undefined,
+      windows: typeof candidate.windows === 'string' ? candidate.windows : undefined,
+    };
+  }
+  const shapeMatch = cleaned.match(/shape[^:]*:\s*([^\n\r]+)/i);
+  const doorsMatch = cleaned.match(/door[^:]*:\s*([^\n\r]+)/i);
+  const windowsMatch = cleaned.match(/window[^:]*:\s*([^\n\r]+)/i);
+  return {
+    shape: shapeMatch?.[1]?.trim(),
+    doors: doorsMatch?.[1]?.trim(),
+    windows: windowsMatch?.[1]?.trim(),
+  };
+};
+
+const describeLayoutSnapshot = async (apiKey: string, layoutImage: string): Promise<LayoutInsight> => {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: [
+                  'You are an architect describing a top-down floor plan.',
+                  'Return JSON with three keys: "shape", "doors", "windows".',
+                  'Each value must be a short clause (<25 words) describing:',
+                  '- overall footprint shape, mentioning corners or curves;',
+                  '- how doors are positioned (which wall, orientation, quantity);',
+                  '- how the largest window or set of windows is positioned (assume standard full-sized windows).',
+                  'Example: {"shape":"a shallow L-shape with a bay", "doors":"two entries on the south wall", "windows":"full-height glazing across the north wall"}.',
+                ].join(' '),
+              },
+              {
+                inlineData: {
+                  mimeType: 'image/png',
+                  data: dataUrlToBase64(layoutImage),
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          topP: 0.8,
+          topK: 32,
+          maxOutputTokens: 256,
+        },
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error('Unable to describe layout geometry');
+  }
+  const payload = await response.json();
+  const description =
+    payload?.candidates?.[0]?.content?.parts?.find((part: { text?: string }) => part.text)?.text ??
+    '';
+  const parsed = parseLayoutInsightText(description);
+  return {
+    shape: sanitizeInsightClause(parsed.shape),
+    doors: sanitizeInsightClause(parsed.doors),
+    windows: sanitizeInsightClause(parsed.windows),
+  };
+};
+
+const generateLayoutNarrative = async (apiKey: string, layoutImage: string) => {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: [
+                  'Provide a detailed, paragraph-style description of this floor plan.',
+                  'Mention every wall segment, corner, window, and door, describing how they connect or align with each other and referencing directions when possible.',
+                  'Door symbols use an arc to show swing—interpret each as a standard rectangular hinged door and describe which wall the hinge sits on and which direction it swings.',
+                  'Keep it under 180 words but make it precise enough for a 3D artist to imagine the space.',
+                ].join(' '),
+              },
+              {
+                inlineData: {
+                  mimeType: 'image/png',
+                  data: dataUrlToBase64(layoutImage),
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          topP: 0.8,
+          topK: 32,
+          maxOutputTokens: 512,
+        },
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error('Unable to generate layout description');
+  }
+  const payload = await response.json();
+  const text =
+    payload?.candidates?.[0]?.content?.parts?.find((part: { text?: string }) => part.text)?.text ??
+    '';
+  return text.replace(/\s+/g, ' ').trim();
+};
+
+const renderPerspectiveFromDescription = async (apiKey: string, description: string) => {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${apiKey}`;
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: [
+                  'Create a photorealistic perspective visualization of the following room description.',
+                  'Show an empty architectural shell only—no furniture, decor, or loose objects—just walls, floor, ceiling, doors, and windows that appear in the text.',
+                  'Use an eye-level camera, balanced natural lighting, award-winning architectural photography aesthetics, and frame it at a 16:9 aspect ratio.',
+                  `Description: ${description}`,
+                ].join(' '),
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.6,
+          topP: 0.8,
+          topK: 32,
+        },
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      `Unable to render layout preview: ${(error as Error)?.message ?? 'network error'}`,
+    );
+  }
+  if (!response.ok) {
+    const message = await response.text().catch(() => response.statusText);
+    throw new Error(
+      `Unable to render layout preview (${response.status}): ${message.slice(0, 400)}`,
+    );
+  }
+  const contentType = response.headers.get('content-type') ?? '';
+  if (contentType.startsWith('image/')) {
+    const buffer = await response.arrayBuffer();
+    const base64 = arrayBufferToBase64(buffer);
+    const dataUrl = `data:${contentType};base64,${base64}`;
+    return enforceAspectRatio(dataUrl, '16:9');
+  }
+
+  const payload = await response.json();
+  const inlineImage = payload?.images?.[0]?.inlineData;
+  let imageDataUrl: string | null = null;
+  if (inlineImage?.data) {
+    imageDataUrl = `data:${inlineImage.mimeType ?? 'image/png'};base64,${inlineImage.data}`;
+  }
+  if (!imageDataUrl) {
+    imageDataUrl =
+      (await extractImageDataFromNode(payload?.candidates ?? [], apiKey)) ??
+      (await extractImageDataFromNode(payload, apiKey));
+  }
+  if (!imageDataUrl) {
+    console.warn('Gemini layout preview payload', payload);
+    throw new Error('Layout preview is missing image data');
+  }
+  return enforceAspectRatio(imageDataUrl, '16:9');
+};
+
 const enforceAspectRatio = async (dataUrl: string, aspectRatio: string) => {
   if (typeof document === 'undefined') return dataUrl;
   const { width, height } = aspectRatioDimensions[aspectRatio] ?? aspectRatioDimensions['16:9'];
@@ -643,8 +1048,39 @@ type NanoBananaPayload = {
   prompt: string;
   stylePreset: string;
   aspectRatio: string;
-  layoutImage: string;
   collageImage: string;
+  layoutInsight?: LayoutInsight | null;
+  layoutDescription?: string | null;
+  layoutPreviewImage: string;
+  lightPresetLabel?: string;
+  graphicPresetLabel?: string;
+};
+
+const buildRenderSystemPrompt = (
+  styleLabel: string,
+  insight?: LayoutInsight | null,
+  extras?: { lighting?: string; graphic?: string },
+) => {
+  const shapeClause =
+    insight?.shape ?? 'a rectilinear outline with clearly defined right-angled corners';
+  const doorsClause =
+    insight?.doors ?? 'along the entry wall highlighted in the plan';
+  const windowsClause =
+    insight?.windows ?? 'along the facade indicated on the plan';
+  const lightingClause =
+    extras?.lighting && extras.lighting !== 'Not specified'
+      ? `- Lighting mood: ${extras.lighting}.`
+      : '';
+  const graphicClause =
+    extras?.graphic && extras.graphic !== 'Not specified'
+      ? `- Graphical treatment: ${extras.graphic}.`
+      : '';
+  return `Create a NEW image of a photorealistic, eye-level 3D render of a room based on the following floor plan description. The room has ${shapeClause}. The doors are located ${doorsClause}. The large windows are located ${windowsClause}.
+- Decorate the room in a ${styleLabel} style.
+- Place all objects from the second image inside the room.
+- Award-winning architectural photography, high level of detail.
+${lightingClause}
+${graphicClause}`.trim();
 };
 
 const requestNanoBananaRender = async ({
@@ -653,28 +1089,57 @@ const requestNanoBananaRender = async ({
   prompt,
   stylePreset,
   aspectRatio,
-  layoutImage,
   collageImage,
+  layoutInsight,
+  layoutDescription,
+  layoutPreviewImage,
+  lightPresetLabel,
+  graphicPresetLabel,
 }: NanoBananaPayload) => {
   const styleLabel = styles.find((styleOption) => styleOption.id === stylePreset)?.label ?? stylePreset;
-  const instructions = `You are Nano Banana, an interior renderer. Use the layout image (floor plan) to place walls, windows, and doors, and use the collage image to capture materials/furniture. Render a photorealistic scene with ${styleLabel} styling. Respect the specified aspect ratio (${aspectRatio}) exactly.`;
+  const systemPromptText = buildRenderSystemPrompt(styleLabel, layoutInsight, {
+    lighting: lightPresetLabel,
+    graphic: graphicPresetLabel,
+  });
+  const trimmedPrompt = prompt.trim();
+  const userParts: Array<
+    | { text: string }
+    | {
+        inlineData: {
+          mimeType: string;
+          data: string;
+        };
+      }
+  > = [];
+  if (layoutDescription && layoutDescription.trim().length > 0) {
+    userParts.push({ text: `Floor plan description: ${layoutDescription.trim()}` });
+  }
+  if (trimmedPrompt.length > 0) {
+    userParts.push({ text: trimmedPrompt });
+  }
+  userParts.push({
+    inlineData: { mimeType: 'image/png', data: dataUrlToBase64(layoutPreviewImage) },
+  });
+  userParts.push({
+    inlineData: { mimeType: 'image/png', data: dataUrlToBase64(collageImage) },
+  });
   const body = {
+    systemInstruction: {
+      role: 'system',
+      parts: [{ text: systemPromptText }],
+    },
     contents: [
       {
         role: 'user',
-        parts: [
-          { text: `${instructions}\n\n${prompt}` },
-          { inlineData: { mimeType: 'image/png', data: dataUrlToBase64(layoutImage) } },
-          { inlineData: { mimeType: 'image/png', data: dataUrlToBase64(collageImage) } },
-        ],
+        parts: userParts,
       },
     ],
     generationConfig: {
       temperature: 0.4,
       topP: 0.8,
       topK: 32,
-      // Gemini 1.5 Flash currently expects aspect ratio hints in the prompt itself.
-      // We already embed the requested ratio in the instructions above.
+      // Gemini 2.5 Flash Image expects aspect ratio hints in the content itself,
+      // so we embed the requested ratio in the prompt and normalize client-side.
     },
   };
   const response = await fetch(
@@ -3046,7 +3511,7 @@ const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
               className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-1 text-sm focus:border-[var(--accent)] focus:outline-none"
             />
             <span className="mt-1 block text-[11px] text-slate-500">
-              ≈ {Math.round(thicknessPx)} px stroke
+              â‰ˆ {Math.round(thicknessPx)} px stroke
             </span>
           </label>
           <label className="block text-xs font-semibold uppercase text-slate-500">
@@ -3209,7 +3674,7 @@ const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
               <p className="mt-4 text-xs text-slate-500">
                 Polyline: click to add points, double-click or press Enter to finish. Rectangle: two
                 clicks. Arc: three clicks (start, control, end). ESC cancels the active tool.
-                Selecting Door/Window spawns a preview that follows your cursor—click any wall
+                Selecting Door/Window spawns a preview that follows your cursorâ€”click any wall
                 (including arcs) to snap and cut the opening with ortho-enabled wall segments.
               </p>
               <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -3298,7 +3763,7 @@ const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
                 {pendingOpening && (
                   <>
                     {' '}
-                    Door/window placement is active—move the cursor over a wall and click to confirm
+                    Door/window placement is activeâ€”move the cursor over a wall and click to confirm
                     or press ESC to cancel.
                   </>
                 )}
@@ -3551,6 +4016,18 @@ function RenderStage({
   const [graphicPresetId, setGraphicPresetId] = useState(
     graphicPresetOptions[0]?.id ?? 'none',
   );
+  const [collageDescription, setCollageDescription] = useState<string | null>(null);
+  const [collageDescriptionStatus, setCollageDescriptionStatus] =
+    useState<CollageDescriptionStatus>('idle');
+  const [layoutInsight, setLayoutInsight] = useState<LayoutInsight | null>(null);
+  const [layoutInsightStatus, setLayoutInsightStatus] =
+    useState<LayoutInsightStatus>('idle');
+  const [layoutNarrative, setLayoutNarrative] = useState<string | null>(null);
+  const [layoutNarrativeStatus, setLayoutNarrativeStatus] =
+    useState<LayoutNarrativeStatus>('idle');
+  const [layoutNarrativeError, setLayoutNarrativeError] = useState<string | null>(null);
+  const [layoutPreviewImage, setLayoutPreviewImage] = useState<string | null>(null);
+  const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const styleLookup = useMemo(() => {
     const map: Record<string, string> = {};
     styles.forEach((styleOption) => {
@@ -3575,12 +4052,9 @@ function RenderStage({
     graphicPresetOptions.find((option) => option.id === graphicPresetId)?.label ??
     graphicPresetOptions[0]?.label ??
     '';
-  const suggestedPrompt = useMemo(() => {
-    return `Using this room floor plan from first image input, create a photorealistic perspective rendering of it in a ${promptStyleLabel} style. The room should have the exact configuration and proportions as shown in the floor plan. Put all the objects from second image input inside the room. Award-winning architectural photography, high level of detail.`;
-  }, [promptStyleLabel]);
   const renderFormValues = useMemo(
     () => ({
-      prompt,
+      prompt: prompt ?? '',
       aspectRatio,
     }),
     [prompt, aspectRatio],
@@ -3590,7 +4064,6 @@ function RenderStage({
     register,
     handleSubmit,
     formState: { errors },
-    setValue,
   } = useForm<RenderForm>({
     resolver: zodResolver(renderSchema),
     values: renderFormValues,
@@ -3614,13 +4087,6 @@ function RenderStage({
       }
     },
   });
-
-  useEffect(() => {
-    if (!prompt && suggestedPrompt) {
-      setPrompt(suggestedPrompt);
-      setValue('prompt', suggestedPrompt, { shouldValidate: true });
-    }
-  }, [prompt, suggestedPrompt, setPrompt, setValue]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3650,39 +4116,135 @@ function RenderStage({
     };
   }, [collageImages]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const schedule = (fn: () => void) => {
+      setTimeout(() => {
+        if (!cancelled) {
+          fn();
+        }
+      }, 0);
+    };
+    if (!collageDataUrl) {
+      schedule(() => {
+        setCollageDescription(null);
+        setCollageDescriptionStatus('idle');
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (!apiKey) {
+      schedule(() => {
+        setCollageDescription(null);
+        setCollageDescriptionStatus('needs-key');
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    schedule(() => {
+      setCollageDescriptionStatus('loading');
+    });
+    describeCollageObjects(apiKey, collageDataUrl)
+      .then((summary) => {
+        if (cancelled) return;
+        setCollageDescription(summary || null);
+        setCollageDescriptionStatus('idle');
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn('Failed to describe collage for prompt template', error);
+        setCollageDescription(null);
+        setCollageDescriptionStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKey, collageDataUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const schedule = (fn: () => void) => {
+      setTimeout(() => {
+        if (!cancelled) {
+          fn();
+        }
+      }, 0);
+    };
+    if (!layoutSnapshot) {
+      schedule(() => {
+        setLayoutInsight(null);
+        setLayoutInsightStatus('idle');
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (!apiKey) {
+      schedule(() => {
+        setLayoutInsight(null);
+        setLayoutInsightStatus('needs-key');
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    schedule(() => {
+      setLayoutInsightStatus('loading');
+    });
+    describeLayoutSnapshot(apiKey, layoutSnapshot)
+      .then((insight) => {
+        if (cancelled) return;
+        setLayoutInsight(insight);
+        setLayoutInsightStatus('idle');
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn('Failed to analyze layout snapshot', error);
+        setLayoutInsight(null);
+        setLayoutInsightStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKey, layoutSnapshot]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setTimeout(() => {
+      if (cancelled) return;
+      setLayoutNarrative(null);
+      setLayoutPreviewImage(null);
+      setLayoutNarrativeStatus('idle');
+      setLayoutNarrativeError(null);
+    }, 0);
+    return () => {
+      cancelled = true;
+    };
+  }, [layoutSnapshot]);
+
   const onSubmit = (values: RenderForm) => {
     if (!apiKey) {
       setRenderHelperMessage('Add your Nano Banana API key in API settings to request renders.');
-      return;
-    }
-    if (!layoutSnapshot) {
-      setRenderHelperMessage('Capture the layout canvas (Layout → Canvas) before rendering.');
       return;
     }
     if (!collageDataUrl) {
       setRenderHelperMessage('Upload at least one object image to build a collage.');
       return;
     }
+    if (!layoutPreviewImage) {
+      setRenderHelperMessage('Generate the layout description and preview before requesting a render.');
+      return;
+    }
     setRenderHelperMessage(null);
-    const trimmedPrompt = values.prompt.trim();
-    const suffixParts: string[] = [];
-    if (lightPresetId !== 'none') {
-      suffixParts.push(`Lighting preset: ${lightPresetLabel}.`);
-    }
-    if (graphicPresetId !== 'none') {
-      suffixParts.push(`Visual treatment: ${graphicPresetLabel}.`);
-    }
-    const finalPrompt = `${trimmedPrompt}${
-      trimmedPrompt.endsWith('.') || trimmedPrompt.endsWith('!') || trimmedPrompt.endsWith('?')
-        ? ''
-        : '.'
-    } ${suffixParts.join(' ')}`.trim();
-    setPrompt(finalPrompt);
+    const trimmedPrompt = (values.prompt ?? '').trim();
+    setPrompt(trimmedPrompt);
     setAspectRatioState(values.aspectRatio);
     const jobId = generateId();
     addRenderJob({
       id: jobId,
-      prompt: finalPrompt,
+      prompt: trimmedPrompt,
       stylePreset: promptStyleId,
       aspectRatio: values.aspectRatio,
       status: 'processing',
@@ -3691,11 +4253,15 @@ function RenderStage({
     renderMutation.mutate({
       jobId,
       apiKey,
-      prompt: finalPrompt,
+      prompt: trimmedPrompt,
       stylePreset: promptStyleId,
       aspectRatio: values.aspectRatio,
-      layoutImage: layoutSnapshot,
       collageImage: collageDataUrl,
+      layoutInsight,
+      layoutDescription: layoutNarrative,
+      layoutPreviewImage,
+      lightPresetLabel: lightPresetId !== 'none' ? lightPresetLabel : undefined,
+      graphicPresetLabel: graphicPresetId !== 'none' ? graphicPresetLabel : undefined,
     });
   };
 
@@ -3715,6 +4281,36 @@ function RenderStage({
     }, 500);
   };
 
+  const handleGenerateLayoutNarrative = useCallback(async () => {
+    if (!apiKey) {
+      setLayoutNarrativeStatus('needs-key');
+      setLayoutNarrativeError('Add your Nano Banana API key to describe the layout.');
+      return;
+    }
+    if (!layoutSnapshot) {
+      setLayoutNarrativeStatus('error');
+      setLayoutNarrativeError('Capture the layout canvas before generating a description.');
+      return;
+    }
+    try {
+      setLayoutNarrativeStatus('loading');
+      setLayoutNarrativeError(null);
+      setLayoutNarrative(null);
+      setLayoutPreviewImage(null);
+      const description = await generateLayoutNarrative(apiKey, layoutSnapshot);
+      setLayoutNarrative(description);
+      const preview = await renderPerspectiveFromDescription(apiKey, description);
+      setLayoutPreviewImage(preview);
+      setLayoutNarrativeStatus('idle');
+    } catch (error) {
+      console.error(error);
+      setLayoutNarrativeStatus('error');
+      setLayoutNarrativeError(
+        error instanceof Error ? error.message : 'Failed to describe the layout.',
+      );
+    }
+  }, [apiKey, layoutSnapshot]);
+
   const handleLayoutSnapshotInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -3722,10 +4318,20 @@ function RenderStage({
     event.target.value = '';
   };
 
-  const applySuggestedPrompt = () => {
-    setPrompt(suggestedPrompt);
-    setValue('prompt', suggestedPrompt, { shouldValidate: true });
-  };
+  const handleShowImage = useCallback((src?: string) => {
+    if (!src || typeof window === 'undefined') return;
+    window.open(src, '_blank', 'noopener,noreferrer');
+  }, []);
+
+  const handleSaveImage = useCallback((src?: string, filename = 'render.png') => {
+    if (!src || typeof document === 'undefined') return;
+    const link = document.createElement('a');
+    link.href = src;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, []);
 
   return (
     <section className="space-y-6 rounded-3xl bg-transparent">
@@ -3754,6 +4360,14 @@ function RenderStage({
               >
                 Canvas
               </button>
+              <button
+                type="button"
+                onClick={handleGenerateLayoutNarrative}
+                className="rounded-full border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 hover:border-slate-300 disabled:opacity-60"
+                disabled={layoutNarrativeStatus === 'loading'}
+              >
+                {layoutNarrativeStatus === 'loading' ? 'Generating...' : 'Generate description'}
+              </button>
             </div>
           </div>
           <div className="mt-4 h-[360px] w-full overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
@@ -3770,6 +4384,88 @@ function RenderStage({
               </p>
             )}
           </div>
+          {layoutInsightStatus === 'loading' && (
+            <p className="mt-2 text-xs text-slate-500">Analyzing layout geometry...</p>
+          )}
+          {layoutInsightStatus === 'needs-key' && (
+            <p className="mt-2 text-xs text-amber-600">
+              Add your Nano Banana API key to capture room shape, door, and window details automatically.
+            </p>
+          )}
+          {layoutInsightStatus === 'error' && (
+            <p className="mt-2 text-xs text-rose-500">
+              Unable to analyze this snapshot. Re-capture the canvas or try again later.
+            </p>
+          )}
+          {layoutInsightStatus === 'idle' && layoutInsight && (
+            <p className="mt-2 text-xs text-slate-500">
+              Shape: {layoutInsight.shape ?? '-'} · Doors: {layoutInsight.doors ?? '-'} · Windows{' '}
+              {layoutInsight.windows ?? '-'}
+            </p>
+          )}
+
+          {layoutNarrativeError && (
+
+            <p className="mt-2 text-xs text-rose-500">{layoutNarrativeError}</p>
+
+          )}
+
+          {layoutNarrativeStatus === 'needs-key' && (
+
+            <p className="mt-2 text-xs text-amber-600">
+
+              Add your Nano Banana API key to generate a description and preview image.
+
+            </p>
+
+          )}
+
+          {layoutNarrative && (
+
+            <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/60 p-4">
+
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+
+                Generated layout description
+
+              </p>
+
+              <p className="mt-2 text-sm leading-relaxed text-slate-700">{layoutNarrative}</p>
+
+            </div>
+
+          )}
+
+          {layoutPreviewImage && (
+            <div className="group relative mt-4 flex min-h-[12rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={layoutPreviewImage}
+                alt="Layout preview render"
+                className="max-h-[16rem] w-full object-contain"
+              />
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-slate-900/0 opacity-0 transition group-hover:bg-slate-900/30 group-hover:opacity-100">
+                <button
+                  type="button"
+                  onClick={() => handleShowImage(layoutPreviewImage)}
+                  className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                >
+                  Show
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleSaveImage(layoutPreviewImage, 'layout-perspective-preview.png')
+                  }
+                  className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          )}
+
+
         </div>
         <div className="rounded-3xl bg-white p-6 shadow-sm">
           <div className="flex items-center justify-between">
@@ -3818,12 +4514,15 @@ function RenderStage({
               {furniture.length} asset{furniture.length === 1 ? '' : 's'} ready for the collage.
             </p>
           )}
+          {collageDescriptionStatus === 'idle' && collageDescription && (
+            <p className="mt-2 text-xs italic text-slate-500">Collage summary: {collageDescription}</p>
+          )}
         </div>
       </div>
 
       <form onSubmit={handleSubmit(onSubmit)} className="grid gap-6 lg:grid-cols-2">
         <div className="rounded-3xl bg-white p-6 shadow-sm">
-          <h3 className="text-lg font-semibold text-slate-900">Text prompt</h3>
+          <h3 className="text-lg font-semibold text-slate-900">Text prompt (optional)</h3>
           <textarea
             {...register('prompt')}
             rows={8}
@@ -3838,8 +4537,7 @@ function RenderStage({
               Prompt template
             </p>
             <p className="mt-2 leading-relaxed">
-              Using this room floor plan from first image input, create a photorealistic perspective
-              rendering of it in a{' '}
+              Create a photorealistic perspective rendering in a{' '}
               <select
                 value={promptStyleId}
                 onChange={(event) => setPromptStyleId(event.target.value)}
@@ -3851,17 +4549,38 @@ function RenderStage({
                   </option>
                 ))}
               </select>{' '}
-              style. The room should have the exact configuration and proportions as shown in the floor
-              plan. Put all the objects from second image input inside the room. Award-winning
-              architectural photography, high level of detail.
+              style.
             </p>
+            {collageDescriptionStatus === 'loading' && (
+              <p className="mt-2 text-xs text-slate-500">Analyzing collage for furniture context...</p>
+            )}
+            {collageDescriptionStatus === 'needs-key' && (
+              <p className="mt-2 text-xs text-amber-600">
+                Add your Nano Banana API key in API settings to summarize the collage automatically.
+              </p>
+            )}
+            {collageDescriptionStatus === 'error' && (
+              <p className="mt-2 text-xs text-rose-500">
+                Couldn&apos;t understand the collage. Re-upload objects or try again.
+              </p>
+            )}
             <button
               type="button"
-              onClick={applySuggestedPrompt}
+              onClick={() => setShowSystemPrompt((prev) => !prev)}
               className="mt-3 rounded-full border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
             >
-              Use template
+              {showSystemPrompt ? 'Hide system prompt' : 'Show system prompt'}
             </button>
+            {showSystemPrompt && (
+              <div className="mt-3 rounded-2xl border border-slate-200 bg-white/80 p-3 text-[11px] leading-relaxed text-slate-600">
+                <p className="whitespace-pre-wrap">
+                  {buildRenderSystemPrompt(promptStyleLabel, layoutInsight, {
+                    lighting: lightPresetId !== 'none' ? lightPresetLabel : undefined,
+                    graphic: graphicPresetId !== 'none' ? graphicPresetLabel : undefined,
+                  })}
+                </p>
+              </div>
+            )}
           </div>
         </div>
 
@@ -3943,30 +4662,50 @@ function RenderStage({
               </span>
             )}
           </div>
-          <div className="mt-4 flex min-h-[18rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+          <div className="mt-4">
             {heroRender?.imageUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={heroRender.imageUrl}
-                alt="Latest render"
-                className="max-h-[28rem] w-full object-contain"
-              />
+              <div className="group relative flex min-h-[18rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={heroRender.imageUrl}
+                  alt="Latest render"
+                  className="max-h-[28rem] w-full object-contain"
+                />
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-slate-900/0 opacity-0 transition group-hover:bg-slate-900/30 group-hover:opacity-100">
+                  <button
+                    type="button"
+                    onClick={() => handleShowImage(heroRender.imageUrl)}
+                    className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                  >
+                    Show
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSaveImage(heroRender.imageUrl, 'hero-render.png')}
+                    className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
             ) : (
-              <p className="flex h-72 items-center justify-center text-sm text-slate-400">
-                No render yet. Configure settings and request one.
-              </p>
+              <div className="flex min-h-[18rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+                <p className="flex h-72 items-center justify-center text-sm text-slate-400">
+                  No render yet. Configure settings and request one.
+                </p>
+              </div>
             )}
           </div>
           {heroRender && (
             <p className="mt-3 text-xs text-slate-500">
-              {styleLookup[heroRender.stylePreset] ?? 'Custom preset'} ·{' '}
+              {styleLookup[heroRender.stylePreset] ?? 'Custom preset'} Â·{' '}
               {heroRender.aspectRatio ?? aspectRatio}
             </p>
           )}
         </div>
         <div className="rounded-3xl bg-white p-6 shadow-sm">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-slate-900">Render queue</h3>
+            <h3 className="text-lg font-semibold text-slate-900">History</h3>
             <span className="text-xs text-slate-400">{renderJobs.length} requests</span>
           </div>
           <div className="mt-4 space-y-3">
@@ -3983,7 +4722,7 @@ function RenderStage({
                 <div className="flex items-start justify-between gap-4">
                   <div>
                     <p className="text-sm font-semibold text-slate-800">
-                      {styleLookup[job.stylePreset] ?? 'Custom preset'} · {job.aspectRatio ?? '16:9'}
+                      {styleLookup[job.stylePreset] ?? 'Custom preset'} Â· {job.aspectRatio ?? '16:9'}
                     </p>
                     <p className="text-xs text-slate-500">{formatDate(job.createdAt)}</p>
                     <p className="mt-1 text-xs text-slate-500">{job.prompt}</p>
@@ -4000,13 +4739,29 @@ function RenderStage({
                   </span>
                 </div>
                 {job.imageUrl && (
-                  <div className="mt-3 flex min-h-[10rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+                  <div className="group relative mt-3 flex min-h-[10rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={job.imageUrl}
                       alt="Render preview"
                       className="max-h-[18rem] w-full object-contain"
                     />
+                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2 bg-slate-900/0 opacity-0 transition group-hover:bg-slate-900/30 group-hover:opacity-100">
+                      <button
+                        type="button"
+                        onClick={() => handleShowImage(job.imageUrl)}
+                        className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                      >
+                        Show
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSaveImage(job.imageUrl, `render-${job.id}.png`)}
+                        className="pointer-events-auto rounded-full bg-white/90 px-4 py-2 text-xs font-semibold text-slate-900 shadow"
+                      >
+                        Save
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -4026,3 +4781,4 @@ const lineIntersection = (a1: Point, a2: Point, b1: Point, b2: Point): Point | n
   const t = ((b1.x - a1.x) * s.y - (b1.y - a1.y) * s.x) / denom;
   return { x: a1.x + t * r.x, y: a1.y + t * r.y };
 };
+
