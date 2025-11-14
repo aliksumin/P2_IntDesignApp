@@ -932,10 +932,7 @@ export default function HomePage() {
       <div className="mx-auto flex max-w-6xl flex-col gap-8">
         <header className="flex flex-col gap-4 rounded-3xl bg-white px-6 py-6 shadow-sm sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p className="text-sm uppercase tracking-[0.2em] text-slate-400">
-              Nano Banana Studio
-            </p>
-            <h1 className="text-3xl font-semibold text-slate-900">P2 Interior Design Companion</h1>
+            <h1 className="text-3xl font-semibold text-slate-900">Interior Design Companion</h1>
             <p className="text-sm text-slate-500">
               Upload or sketch a plan, request renders, then refine materials in one place.
             </p>
