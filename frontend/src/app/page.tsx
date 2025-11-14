@@ -41,8 +41,6 @@ const renderSchema = z.object({
     .string()
     .min(10, 'Prompt should describe the desired style')
     .max(600),
-  stylePreset: z.string(),
-  cameraHeight: z.number().min(0.5).max(3),
   aspectRatio: z.string(),
 });
 
@@ -121,7 +119,6 @@ const initialLayoutMeta = {
 
 const initialPrompt =
   'Modern Scandinavian living room with warm lighting and textured walls.';
-const initialStylePreset = 'natural-soft';
 const defaultColor = '#111111';
 const defaultWallThicknessMm = 200;
 const UNDO_HISTORY_LIMIT = 50;
@@ -552,6 +549,25 @@ const loadImageElement = (src: string) =>
     image.src = src;
   });
 
+const aspectRatioPresets = [
+  { ratio: '1:1', width: 1024, height: 1024 },
+  { ratio: '3:2', width: 1200, height: 800 },
+  { ratio: '2:3', width: 800, height: 1200 },
+  { ratio: '4:5', width: 1024, height: 1280 },
+  { ratio: '5:4', width: 1280, height: 1024 },
+  { ratio: '3:4', width: 864, height: 1152 },
+  { ratio: '4:3', width: 1152, height: 864 },
+  { ratio: '9:16', width: 828, height: 1472 },
+  { ratio: '16:9', width: 1472, height: 828 },
+  { ratio: '21:9', width: 1728, height: 744 },
+];
+
+const aspectRatioDimensions: Record<string, { width: number; height: number }> = Object.fromEntries(
+  aspectRatioPresets.map((preset) => [preset.ratio, { width: preset.width, height: preset.height }]),
+);
+
+const aspectRatioOptions = aspectRatioPresets.map((preset) => preset.ratio);
+
 const composeCollageDataUrl = async (items: FurnitureSample[]) => {
   if (typeof document === 'undefined') {
     return null;
@@ -601,6 +617,26 @@ const dataUrlToBase64 = (value: string) => {
   return parts.length > 1 ? parts[1] : value;
 };
 
+const enforceAspectRatio = async (dataUrl: string, aspectRatio: string) => {
+  if (typeof document === 'undefined') return dataUrl;
+  const { width, height } = aspectRatioDimensions[aspectRatio] ?? aspectRatioDimensions['16:9'];
+  const image = await loadImageElement(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return dataUrl;
+  const scale = Math.max(canvas.width / image.width, canvas.height / image.height);
+  const drawWidth = image.width * scale;
+  const drawHeight = image.height * scale;
+  const offsetX = (canvas.width - drawWidth) / 2;
+  const offsetY = (canvas.height - drawHeight) / 2;
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
+  return canvas.toDataURL('image/png');
+};
+
 type NanoBananaPayload = {
   jobId: string;
   apiKey: string;
@@ -609,7 +645,6 @@ type NanoBananaPayload = {
   aspectRatio: string;
   layoutImage: string;
   collageImage: string;
-  cameraHeight: number;
 };
 
 const requestNanoBananaRender = async ({
@@ -620,10 +655,9 @@ const requestNanoBananaRender = async ({
   aspectRatio,
   layoutImage,
   collageImage,
-  cameraHeight,
 }: NanoBananaPayload) => {
   const styleLabel = styles.find((styleOption) => styleOption.id === stylePreset)?.label ?? stylePreset;
-  const instructions = `You are Nano Banana, an interior renderer. Use the layout image (floor plan) to place walls, windows, and doors, and use the collage image to capture materials/furniture. Render a photorealistic scene with ${styleLabel} styling. Keep the virtual camera height at ${cameraHeight} meters and aspect ratio ${aspectRatio}.`;
+  const instructions = `You are Nano Banana, an interior renderer. Use the layout image (floor plan) to place walls, windows, and doors, and use the collage image to capture materials/furniture. Render a photorealistic scene with ${styleLabel} styling. Respect the specified aspect ratio (${aspectRatio}) exactly.`;
   const body = {
     contents: [
       {
@@ -668,8 +702,9 @@ const requestNanoBananaRender = async ({
   if (!inlineData?.data) {
     throw new Error('Nano Banana did not return an image payload.');
   }
-  const imageUrl = `data:${inlineData.mimeType ?? 'image/png'};base64,${inlineData.data}`;
-  return { jobId, imageUrl };
+  const baseImageUrl = `data:${inlineData.mimeType ?? 'image/png'};base64,${inlineData.data}`;
+  const normalizedImageUrl = await enforceAspectRatio(baseImageUrl, aspectRatio);
+  return { jobId, imageUrl: normalizedImageUrl };
 };
 
 const rectsIntersect = (
@@ -787,10 +822,16 @@ const wallTools = [
 type WallToolId = (typeof wallTools)[number]['id'];
 
 const styles = [
-  { id: 'natural-soft', label: 'Natural soft light' },
-  { id: 'nocturnal', label: 'Moody evening' },
-  { id: 'studio-crisp', label: 'Studio crisp' },
-  { id: 'vignette', label: 'Vignette' },
+  { id: 'modern', label: 'Modern' },
+  { id: 'contemporary', label: 'Contemporary' },
+  { id: 'scandinavian', label: 'Scandinavian' },
+  { id: 'minimalist', label: 'Minimalist' },
+  { id: 'industrial', label: 'Industrial' },
+  { id: 'mid-century', label: 'Mid-Century Modern' },
+  { id: 'bohemian', label: 'Bohemian' },
+  { id: 'japandi', label: 'Japandi' },
+  { id: 'art-deco', label: 'Art Deco' },
+  { id: 'farmhouse', label: 'Modern Farmhouse' },
 ];
 
 const generateId = () =>
@@ -814,7 +855,6 @@ export default function HomePage() {
   const [elements, setElements] = useState<LayoutElement[]>([]);
   const [furniture, setFurniture] = useState<FurnitureSample[]>([]);
   const [prompt, setPrompt] = useState(initialPrompt);
-  const [stylePreset, setStylePreset] = useState(initialStylePreset);
   const [renderJobs, setRenderJobs] = useState<RenderJob[]>([]);
   const [materialEdits, setMaterialEdits] = useState<MaterialEdit[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKeys>({});
@@ -984,13 +1024,10 @@ export default function HomePage() {
         )}
         {activeStep === 2 && (
           <RenderStage
-            layoutName={layoutMeta.layoutName}
             furniture={furniture}
             setFurniture={setFurniture}
             prompt={prompt}
             setPrompt={setPrompt}
-            stylePreset={stylePreset}
-            setStylePreset={setStylePreset}
             renderJobs={renderJobs}
             addRenderJob={addRenderJob}
             updateRenderJob={updateRenderJob}
@@ -3450,13 +3487,10 @@ const outlineShapes = Array.from(outlineEdgeMap.values()).map((edge, idx) => (
 }
 
 type RenderStageProps = {
-  layoutName: string;
   furniture: FurnitureSample[];
   setFurniture: Dispatch<SetStateAction<FurnitureSample[]>>;
   prompt: string;
   setPrompt: (value: string) => void;
-  stylePreset: string;
-  setStylePreset: (value: string) => void;
   renderJobs: RenderJob[];
   addRenderJob: (job: RenderJob) => void;
   updateRenderJob: (jobId: string, patch: Partial<RenderJob>) => void;
@@ -3466,14 +3500,40 @@ type RenderStageProps = {
   apiKey?: string;
 };
 
+const promptStyleOptions = styles;
+const lightPresetOptions = [
+  { id: 'none', label: 'Not specified' },
+  { id: 'north-daylight', label: 'Soft north-facing daylight' },
+  { id: 'south-sun', label: 'Warm south-facing sun' },
+  { id: 'evening-ambient', label: 'Evening ambient sconces' },
+  { id: 'task-pendants', label: 'Task pendants over seating' },
+  { id: 'floor-lamps', label: 'Cozy floor lamps' },
+  { id: 'cove-led', label: 'Cove LED uplighting' },
+  { id: 'museum-spot', label: 'Museum-grade spotlights' },
+  { id: 'diffused-sheer', label: 'Diffused sheer-curtain light' },
+  { id: 'fireplace-glow', label: 'Fireplace glow accent' },
+  { id: 'neon-art', label: 'Neon wall art lighting' },
+];
+
+const graphicPresetOptions = [
+  { id: 'none', label: 'Not specified' },
+  { id: 'hyper-real', label: 'Hyper-real photography' },
+  { id: 'cinematic', label: 'Cinematic render style' },
+  { id: 'hand-drawn', label: 'Hand-drawn sketch overlay' },
+  { id: 'watercolor', label: 'Watercolor illustration' },
+  { id: 'linework', label: 'Crisp architectural linework' },
+  { id: 'grainy-film', label: 'Grainy film still' },
+  { id: '3d-studio', label: '3D studio visualization' },
+  { id: 'bold-graphic', label: 'Bold graphic poster' },
+  { id: 'soft-pastel', label: 'Soft pastel rendering' },
+  { id: 'tech-visual', label: 'Tech visualization' },
+];
+
 function RenderStage({
-  layoutName,
   furniture,
   setFurniture,
   prompt,
   setPrompt,
-  stylePreset,
-  setStylePreset,
   renderJobs,
   addRenderJob,
   updateRenderJob,
@@ -3486,6 +3546,11 @@ function RenderStage({
   const [aspectRatio, setAspectRatioState] = useState('16:9');
   const [collageDataUrl, setCollageDataUrl] = useState<string | null>(null);
   const [renderHelperMessage, setRenderHelperMessage] = useState<string | null>(null);
+  const [promptStyleId, setPromptStyleId] = useState(promptStyleOptions[0]?.id ?? 'modern');
+  const [lightPresetId, setLightPresetId] = useState(lightPresetOptions[0]?.id ?? 'none');
+  const [graphicPresetId, setGraphicPresetId] = useState(
+    graphicPresetOptions[0]?.id ?? 'none',
+  );
   const styleLookup = useMemo(() => {
     const map: Record<string, string> = {};
     styles.forEach((styleOption) => {
@@ -3498,20 +3563,27 @@ function RenderStage({
     () => renderJobs.find((job) => job.status === 'complete') ?? renderJobs[0],
     [renderJobs],
   );
+  const promptStyleLabel =
+    promptStyleOptions.find((styleOption) => styleOption.id === promptStyleId)?.label ??
+    promptStyleOptions[0]?.label ??
+    'Modern';
+  const lightPresetLabel =
+    lightPresetOptions.find((option) => option.id === lightPresetId)?.label ??
+    lightPresetOptions[0]?.label ??
+    '';
+  const graphicPresetLabel =
+    graphicPresetOptions.find((option) => option.id === graphicPresetId)?.label ??
+    graphicPresetOptions[0]?.label ??
+    '';
   const suggestedPrompt = useMemo(() => {
-    const heroObjects = furniture.slice(0, 3).map((item) => item.name);
-    const objectText =
-      heroObjects.length > 0 ? ` featuring ${heroObjects.join(', ')} arranged per the plan` : '';
-    return `Create a photorealistic visualization of the ${layoutName} using the Step 1 layout${objectText}. Preserve proportions from the CAD snapshot, show natural materials, and balance daylight with warm accent lighting.`;
-  }, [layoutName, furniture]);
+    return `Using this room floor plan from first image input, create a photorealistic perspective rendering of it in a ${promptStyleLabel} style. The room should have the exact configuration and proportions as shown in the floor plan. Put all the objects from second image input inside the room. Award-winning architectural photography, high level of detail.`;
+  }, [promptStyleLabel]);
   const renderFormValues = useMemo(
     () => ({
       prompt,
-      stylePreset,
-      cameraHeight: 1.4,
       aspectRatio,
     }),
-    [prompt, stylePreset, aspectRatio],
+    [prompt, aspectRatio],
   );
 
   const {
@@ -3592,14 +3664,26 @@ function RenderStage({
       return;
     }
     setRenderHelperMessage(null);
-    setPrompt(values.prompt);
-    setStylePreset(values.stylePreset);
+    const trimmedPrompt = values.prompt.trim();
+    const suffixParts: string[] = [];
+    if (lightPresetId !== 'none') {
+      suffixParts.push(`Lighting preset: ${lightPresetLabel}.`);
+    }
+    if (graphicPresetId !== 'none') {
+      suffixParts.push(`Visual treatment: ${graphicPresetLabel}.`);
+    }
+    const finalPrompt = `${trimmedPrompt}${
+      trimmedPrompt.endsWith('.') || trimmedPrompt.endsWith('!') || trimmedPrompt.endsWith('?')
+        ? ''
+        : '.'
+    } ${suffixParts.join(' ')}`.trim();
+    setPrompt(finalPrompt);
     setAspectRatioState(values.aspectRatio);
     const jobId = generateId();
     addRenderJob({
       id: jobId,
-      prompt: values.prompt,
-      stylePreset: values.stylePreset,
+      prompt: finalPrompt,
+      stylePreset: promptStyleId,
       aspectRatio: values.aspectRatio,
       status: 'processing',
       createdAt: timestamp(),
@@ -3607,12 +3691,11 @@ function RenderStage({
     renderMutation.mutate({
       jobId,
       apiKey,
-      prompt: values.prompt,
-      stylePreset: values.stylePreset,
+      prompt: finalPrompt,
+      stylePreset: promptStyleId,
       aspectRatio: values.aspectRatio,
       layoutImage: layoutSnapshot,
       collageImage: collageDataUrl,
-      cameraHeight: values.cameraHeight,
     });
   };
 
@@ -3643,8 +3726,6 @@ function RenderStage({
     setPrompt(suggestedPrompt);
     setValue('prompt', suggestedPrompt, { shouldValidate: true });
   };
-
-  const aspectRatioOptions = ['16:9', '4:3', '1:1', '9:16'];
 
   return (
     <section className="space-y-6 rounded-3xl bg-transparent">
@@ -3692,7 +3773,7 @@ function RenderStage({
         </div>
         <div className="rounded-3xl bg-white p-6 shadow-sm">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-slate-900">Object collage</h3>
+            <h3 className="text-lg font-semibold text-slate-900">Objects</h3>
             <div>
               <input
                 id="furniture-upload"
@@ -3752,28 +3833,65 @@ function RenderStage({
           {errors.prompt && (
             <p className="mt-1 text-xs text-rose-500">{errors.prompt.message}</p>
           )}
-          <button
-            type="button"
-            onClick={applySuggestedPrompt}
-            className="mt-3 rounded-full border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
-          >
-            Use suggested prompt
-          </button>
-          <p className="mt-2 text-xs italic text-slate-400">“{suggestedPrompt}”</p>
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50/50 p-4 text-sm text-slate-600">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Prompt template
+            </p>
+            <p className="mt-2 leading-relaxed">
+              Using this room floor plan from first image input, create a photorealistic perspective
+              rendering of it in a{' '}
+              <select
+                value={promptStyleId}
+                onChange={(event) => setPromptStyleId(event.target.value)}
+                className="inline-flex rounded-full border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 focus:border-[var(--accent)] focus:outline-none"
+              >
+                {promptStyleOptions.map((style) => (
+                  <option key={style.id} value={style.id}>
+                    {style.label}
+                  </option>
+                ))}
+              </select>{' '}
+              style. The room should have the exact configuration and proportions as shown in the floor
+              plan. Put all the objects from second image input inside the room. Award-winning
+              architectural photography, high level of detail.
+            </p>
+            <button
+              type="button"
+              onClick={applySuggestedPrompt}
+              className="mt-3 rounded-full border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
+            >
+              Use template
+            </button>
+          </div>
         </div>
 
         <div className="rounded-3xl bg-white p-6 shadow-sm">
-          <h3 className="text-lg font-semibold text-slate-900">Nano Banana settings</h3>
+          <h3 className="text-lg font-semibold text-slate-900">Settings</h3>
           <div className="mt-4 space-y-4">
             <label className="block text-xs font-semibold uppercase text-slate-500">
-              Style preset
+              Light preset
               <select
-                {...register('stylePreset')}
+                value={lightPresetId}
+                onChange={(event) => setLightPresetId(event.target.value)}
                 className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
               >
-                {styles.map((styleOption) => (
-                  <option key={styleOption.id} value={styleOption.id}>
-                    {styleOption.label}
+                {lightPresetOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block text-xs font-semibold uppercase text-slate-500">
+              Graphical style preset
+              <select
+                value={graphicPresetId}
+                onChange={(event) => setGraphicPresetId(event.target.value)}
+                className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
+              >
+                {graphicPresetOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
                   </option>
                 ))}
               </select>
@@ -3790,18 +3908,6 @@ function RenderStage({
                   </option>
                 ))}
               </select>
-            </label>
-            <label className="block text-xs font-semibold uppercase text-slate-500">
-              Camera height (m)
-              <input
-                type="number"
-                step="0.1"
-                {...register('cameraHeight', { valueAsNumber: true })}
-                className="mt-1 w-full rounded-2xl border border-slate-200 px-4 py-2 text-sm focus:border-[var(--accent)] focus:outline-none"
-              />
-              {errors.cameraHeight && (
-                <p className="mt-1 text-xs text-rose-500">{errors.cameraHeight.message}</p>
-              )}
             </label>
           </div>
           <button
@@ -3837,10 +3943,14 @@ function RenderStage({
               </span>
             )}
           </div>
-          <div className="mt-4 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+          <div className="mt-4 flex min-h-[18rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
             {heroRender?.imageUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={heroRender.imageUrl} alt="Latest render" className="h-72 w-full object-cover" />
+              <img
+                src={heroRender.imageUrl}
+                alt="Latest render"
+                className="max-h-[28rem] w-full object-contain"
+              />
             ) : (
               <p className="flex h-72 items-center justify-center text-sm text-slate-400">
                 No render yet. Configure settings and request one.
@@ -3890,12 +4000,12 @@ function RenderStage({
                   </span>
                 </div>
                 {job.imageUrl && (
-                  <div className="mt-3 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
+                  <div className="mt-3 flex min-h-[10rem] items-center justify-center overflow-hidden rounded-2xl border border-slate-100 bg-slate-50">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={job.imageUrl}
                       alt="Render preview"
-                      className="h-40 w-full object-cover"
+                      className="max-h-[18rem] w-full object-contain"
                     />
                   </div>
                 )}
